@@ -1,0 +1,2471 @@
+use pi::agent::{
+    Agent, AgentMessage, AgentOptions, AgentStateOverride, AgentTool, AgentToolResult, LlmContext,
+    Model as AgentModel, QueueMode, ThinkingLevel,
+};
+use pi::cli::list_models::list_models;
+use pi::coding_agent::tools as agent_tools;
+use pi::coding_agent::{
+    AgentSession, AgentSessionConfig, AuthCredential, AuthStorage, Model as RegistryModel,
+    ModelRegistry, SettingsManager,
+};
+use pi::core::messages::{
+    AgentMessage as CoreAgentMessage, AssistantMessage, ContentBlock, Cost, ToolResultMessage,
+    Usage, UserContent,
+};
+use pi::core::session_manager::SessionManager;
+use pi::tools::{default_tools, ToolContext, ToolDefinition};
+use pi::{parse_args, Args, ListModels, Mode};
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::env;
+use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+use std::process;
+use std::rc::Rc;
+
+const DEFAULT_OAUTH_SYSTEM_PROMPT: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+const CONFIG_DIR_NAME: &str = ".pi";
+
+fn print_help() {
+    println!(
+        "pi (rust) minimal CLI
+
+Usage:
+  pi [options] [messages...]
+
+Options:
+  --help, -h       Show this help
+  --version, -v    Show version
+  --provider       Provider name (anthropic only for now)
+  --model          Model id
+  --models         Comma-separated model patterns
+  --api-key        Override provider API key
+  --system-prompt  Custom system prompt (literal or file path)
+  --append-system-prompt  Append text to system prompt (literal or file path)
+  --tools          Comma-separated tool allowlist
+  --print, -p      Print mode (single-shot)
+  --list-models    List available models
+  --mode <mode>    Output mode: text (default), json, rpc
+  @file            Include file contents in prompt (text or images)
+
+Notes:
+  Interactive mode and other flags are not implemented yet."
+    );
+}
+
+fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
+    let mut unsupported = Vec::new();
+
+    if parsed.thinking.is_some() {
+        unsupported.push("--thinking");
+    }
+    if parsed.continue_session {
+        unsupported.push("--continue");
+    }
+    if parsed.resume {
+        unsupported.push("--resume");
+    }
+    if parsed.no_session {
+        unsupported.push("--no-session");
+    }
+    if parsed.session.is_some() {
+        unsupported.push("--session");
+    }
+    if parsed.session_dir.is_some() {
+        unsupported.push("--session-dir");
+    }
+    if parsed.hooks.is_some() {
+        unsupported.push("--hook");
+    }
+    if parsed.custom_tools.is_some() {
+        unsupported.push("--tool");
+    }
+    if parsed.export.is_some() {
+        unsupported.push("--export");
+    }
+    if parsed.no_skills {
+        unsupported.push("--no-skills");
+    }
+    if parsed.skills.is_some() {
+        unsupported.push("--skills");
+    }
+    unsupported
+}
+
+type AuthStorageData = HashMap<String, AuthCredential>;
+type AgentStreamFn = Box<dyn FnMut(&AgentModel, &LlmContext) -> AssistantMessage>;
+
+struct AnthropicCallOptions<'a> {
+    model: &'a str,
+    api_key: &'a str,
+    use_oauth: bool,
+    tools: &'a [AnthropicTool],
+    base_url: &'a str,
+    extra_headers: Option<&'a HashMap<String, String>>,
+    system: Option<&'a str>,
+}
+
+struct PrintModeOptions<'a> {
+    tool_names: Option<&'a [String]>,
+    image_blocks: &'a [AnthropicContentBlock],
+    system_prompt: Option<String>,
+    append_system_prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AnthropicRequest {
+    model: String,
+    max_tokens: u32,
+    messages: Vec<AnthropicMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicTool>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AnthropicMessage {
+    role: String,
+    content: Vec<AnthropicContentBlock>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContentBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Vec<AnthropicToolResultContent>,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicToolResultContent {
+    Text { text: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcImage {
+    #[serde(rename = "type")]
+    _image_type: Option<String>,
+    data: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcCommandEnvelope {
+    #[serde(rename = "type")]
+    command_type: String,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcPromptCommand {
+    message: String,
+    #[serde(default)]
+    images: Vec<RpcImage>,
+    #[serde(rename = "streamingBehavior")]
+    streaming_behavior: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSteerCommand {
+    #[serde(default)]
+    id: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcFollowUpCommand {
+    #[serde(default)]
+    id: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcAbortCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcNewSessionCommand {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "parentSession")]
+    parent_session: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcGetStateCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSetThinkingLevelCommand {
+    #[serde(default)]
+    id: Option<String>,
+    level: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcCycleThinkingLevelCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcGetAvailableModelsCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSetModelCommand {
+    #[serde(default)]
+    id: Option<String>,
+    provider: String,
+    #[serde(rename = "modelId")]
+    model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcCycleModelCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcGetSessionStatsCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcCompactCommand {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "customInstructions")]
+    custom_instructions: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSetAutoCompactionCommand {
+    #[serde(default)]
+    id: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSetAutoRetryCommand {
+    #[serde(default)]
+    id: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcAbortRetryCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcExportHtmlCommand {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "outputPath")]
+    output_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcBashCommand {
+    #[serde(default)]
+    id: Option<String>,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcAbortBashCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcGetLastAssistantTextCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSwitchSessionCommand {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "sessionPath")]
+    session_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcBranchCommand {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "entryId")]
+    entry_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcGetBranchMessagesCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcGetMessagesCommand {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSetSteeringModeCommand {
+    #[serde(default)]
+    id: Option<String>,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcSetFollowUpModeCommand {
+    #[serde(default)]
+    id: Option<String>,
+    mode: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicContentBlock>,
+    stop_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicErrorResponse {
+    error: AnthropicError,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicError {
+    message: String,
+}
+
+fn build_anthropic_headers(
+    api_key: &str,
+    use_oauth: bool,
+    extra_headers: Option<&HashMap<String, String>>,
+) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    if use_oauth {
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("oauth-2025-04-20"),
+        );
+        let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|err| format!("Invalid OAuth token: {err}"))?;
+        headers.insert("authorization", value);
+    } else {
+        let value =
+            HeaderValue::from_str(api_key).map_err(|err| format!("Invalid API key: {err}"))?;
+        headers.insert("x-api-key", value);
+    }
+    if let Some(extra) = extra_headers {
+        for (key, value) in extra {
+            let header_name = HeaderName::from_bytes(key.as_bytes())
+                .map_err(|err| format!("Invalid header name \"{key}\": {err}"))?;
+            let header_value = HeaderValue::from_str(value)
+                .map_err(|err| format!("Invalid header value: {err}"))?;
+            headers.insert(header_name, header_value);
+        }
+    }
+    Ok(headers)
+}
+
+fn get_agent_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("PI_CODING_AGENT_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+
+    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()?;
+    Some(PathBuf::from(home).join(".pi").join("agent"))
+}
+
+fn get_auth_path() -> Option<PathBuf> {
+    get_agent_dir().map(|dir| dir.join("auth.json"))
+}
+
+fn get_models_path() -> Option<PathBuf> {
+    get_agent_dir().map(|dir| dir.join("models.json"))
+}
+
+fn env_var_non_empty(key: &str) -> Option<String> {
+    env::var(key).ok().and_then(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
+fn apply_env_api_keys_for_availability(auth_storage: &mut AuthStorage) {
+    if !auth_storage.has("anthropic") {
+        if let Some(token) = env_var_non_empty("ANTHROPIC_OAUTH_TOKEN") {
+            auth_storage.set_runtime_api_key("anthropic", &token);
+        } else if let Some(key) = env_var_non_empty("ANTHROPIC_API_KEY") {
+            auth_storage.set_runtime_api_key("anthropic", &key);
+        }
+    }
+
+    if !auth_storage.has("openai") {
+        if let Some(key) = env_var_non_empty("OPENAI_API_KEY") {
+            auth_storage.set_runtime_api_key("openai", &key);
+        }
+    }
+
+    if !auth_storage.has("google") {
+        if let Some(key) = env_var_non_empty("GEMINI_API_KEY") {
+            auth_storage.set_runtime_api_key("google", &key);
+        }
+    }
+}
+
+fn build_model_registry(
+    api_key_override: Option<&str>,
+    provider: Option<&str>,
+) -> Result<ModelRegistry, String> {
+    let auth_path =
+        get_auth_path().ok_or_else(|| "Unable to resolve auth.json path.".to_string())?;
+    let mut auth_storage = AuthStorage::new(auth_path);
+    apply_env_api_keys_for_availability(&mut auth_storage);
+    if let Some(api_key) = api_key_override {
+        let provider = provider.unwrap_or("anthropic");
+        auth_storage.set_runtime_api_key(provider, api_key);
+    }
+    Ok(ModelRegistry::new(auth_storage, get_models_path()))
+}
+
+fn read_auth_json() -> Option<AuthCredential> {
+    let path = get_auth_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let data: AuthStorageData = serde_json::from_str(&content).ok()?;
+    data.get("anthropic").cloned()
+}
+
+fn resolve_anthropic_credentials(api_key_override: Option<&str>) -> Result<(String, bool), String> {
+    if let Some(key) = api_key_override {
+        return Ok((key.to_string(), false));
+    }
+
+    if let Some(credential) = read_auth_json() {
+        match credential {
+            AuthCredential::ApiKey { key } => return Ok((key, false)),
+            AuthCredential::OAuth { access, .. } => return Ok((access, true)),
+        }
+    }
+
+    if let Some(token) = env_var_non_empty("ANTHROPIC_OAUTH_TOKEN") {
+        return Ok((token, true));
+    }
+
+    if let Some(key) = env_var_non_empty("ANTHROPIC_API_KEY") {
+        return Ok((key, false));
+    }
+
+    Err(
+        "Missing Anthropic credentials. Set ANTHROPIC_OAUTH_TOKEN or ANTHROPIC_API_KEY."
+            .to_string(),
+    )
+}
+
+fn resolve_prompt_input(input: Option<&str>, description: &str) -> Option<String> {
+    let input = input?;
+    if input.trim().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(input);
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => Some(content),
+            Err(err) => {
+                eprintln!(
+                    "Warning: Could not read {} file {}: {}",
+                    description, input, err
+                );
+                Some(input.to_string())
+            }
+        }
+    } else {
+        Some(input.to_string())
+    }
+}
+
+fn discover_system_prompt_file() -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?;
+    let project_path = cwd.join(CONFIG_DIR_NAME).join("SYSTEM.md");
+    if project_path.exists() {
+        return Some(project_path);
+    }
+
+    let global_path = get_agent_dir()?.join("SYSTEM.md");
+    if global_path.exists() {
+        return Some(global_path);
+    }
+
+    None
+}
+
+fn resolve_file_arg(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else if let Ok(cwd) = env::current_dir() {
+        cwd.join(path)
+    } else {
+        path
+    }
+}
+
+struct FileInputs {
+    text_prefix: String,
+    images: Vec<AnthropicContentBlock>,
+}
+
+fn build_file_inputs(file_args: &[String]) -> Result<FileInputs, String> {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for file_arg in file_args {
+        let path = resolve_file_arg(file_arg);
+        let data = std::fs::read(&path)
+            .map_err(|err| format!("Error: Could not read file {}: {}", path.display(), err))?;
+        if data.is_empty() {
+            continue;
+        }
+
+        if let Some(mime_type) = detect_image_mime_type(&data) {
+            let encoded = base64_encode(&data);
+            images.push(AnthropicContentBlock::Image {
+                source: AnthropicImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: mime_type.to_string(),
+                    data: encoded,
+                },
+            });
+            text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
+            continue;
+        }
+
+        let content = String::from_utf8(data)
+            .map_err(|err| format!("Error: Could not read file {}: {}", path.display(), err))?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        text.push_str(&format!("<file name=\"{}\">\n", path.display()));
+        text.push_str(&content);
+        if !content.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("</file>\n");
+    }
+    Ok(FileInputs {
+        text_prefix: text,
+        images,
+    })
+}
+
+fn call_anthropic(
+    messages: Vec<AnthropicMessage>,
+    options: AnthropicCallOptions<'_>,
+) -> Result<AnthropicResponse, String> {
+    let request = AnthropicRequest {
+        model: options.model.to_string(),
+        max_tokens: 1024,
+        messages,
+        system: options.system.map(|value| value.to_string()),
+        tools: if options.tools.is_empty() {
+            None
+        } else {
+            Some(options.tools.to_vec())
+        },
+    };
+
+    let headers =
+        build_anthropic_headers(options.api_key, options.use_oauth, options.extra_headers)?;
+    let endpoint = format!("{}/messages", options.base_url.trim_end_matches('/'));
+    let client = Client::new();
+    let response = client
+        .post(endpoint)
+        .headers(headers)
+        .json(&request)
+        .send()
+        .map_err(|err| format!("Request failed: {err}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().unwrap_or_default();
+        if let Ok(error_response) = serde_json::from_str::<AnthropicErrorResponse>(&text) {
+            return Err(format!("Anthropic error: {}", error_response.error.message));
+        }
+        return Err(format!("Anthropic error: {} {}", status.as_u16(), text));
+    }
+
+    response
+        .json::<AnthropicResponse>()
+        .map_err(|err| format!("Failed to parse response: {err}"))
+}
+
+fn run_print_mode(
+    mode: Mode,
+    messages: &[String],
+    model: &RegistryModel,
+    api_key_override: Option<&str>,
+    options: PrintModeOptions<'_>,
+) -> Result<(), String> {
+    let prompt = messages.join("\n");
+    if prompt.trim().is_empty() && options.image_blocks.is_empty() {
+        return Err("No messages provided.".to_string());
+    }
+
+    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
+
+    let mut tool_defs = default_tools();
+    if let Some(tool_names) = options.tool_names {
+        let missing = tool_names
+            .iter()
+            .filter(|name| !tool_defs.iter().any(|tool| tool.name == name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "Tool(s) not implemented yet: {}",
+                missing.join(", ")
+            ));
+        }
+        tool_defs.retain(|tool| tool_names.iter().any(|name| name == tool.name));
+    }
+    let tool_specs = tool_defs
+        .iter()
+        .map(|tool| AnthropicTool {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+            input_schema: tool.input_schema.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let cwd = env::current_dir().map_err(|err| format!("Failed to read cwd: {err}"))?;
+    let tool_ctx = ToolContext { cwd };
+
+    let mut initial_content = Vec::new();
+    if !prompt.trim().is_empty() {
+        initial_content.push(AnthropicContentBlock::Text { text: prompt });
+    }
+    initial_content.extend(options.image_blocks.iter().cloned());
+
+    let mut system = options.system_prompt.or_else(|| {
+        if use_oauth {
+            Some(DEFAULT_OAUTH_SYSTEM_PROMPT.to_string())
+        } else {
+            None
+        }
+    });
+    if let Some(append) = options.append_system_prompt {
+        system = Some(match system {
+            Some(base) => format!("{base}\n\n{append}"),
+            None => append,
+        });
+    }
+
+    let mut conversation = vec![AnthropicMessage {
+        role: "user".to_string(),
+        content: initial_content,
+    }];
+
+    let mut last_response: Option<AnthropicResponse> = None;
+    for _ in 0..10 {
+        let response = call_anthropic(
+            conversation.clone(),
+            AnthropicCallOptions {
+                model: &model.id,
+                api_key: &api_key,
+                use_oauth,
+                tools: &tool_specs,
+                base_url: if model.base_url.is_empty() {
+                    "https://api.anthropic.com/v1"
+                } else {
+                    model.base_url.as_str()
+                },
+                extra_headers: model.headers.as_ref(),
+                system: system.as_deref(),
+            },
+        )?;
+        let tool_uses = extract_tool_uses(&response.content);
+
+        conversation.push(AnthropicMessage {
+            role: "assistant".to_string(),
+            content: response.content.clone(),
+        });
+
+        if tool_uses.is_empty() {
+            last_response = Some(response);
+            break;
+        }
+
+        let tool_results = tool_uses
+            .into_iter()
+            .map(|tool_use| execute_tool_use(&tool_use, &tool_defs, &tool_ctx))
+            .collect();
+
+        conversation.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: tool_results,
+        });
+    }
+
+    let response = last_response.ok_or_else(|| "Tool loop exceeded limit".to_string())?;
+
+    match mode {
+        Mode::Text => {
+            for block in &response.content {
+                match block {
+                    AnthropicContentBlock::Text { text } => println!("{text}"),
+                    AnthropicContentBlock::Image { .. } => {}
+                    AnthropicContentBlock::ToolUse { .. } => {}
+                    AnthropicContentBlock::ToolResult { .. } => {}
+                }
+            }
+        }
+        Mode::Json => {
+            let payload = json!({
+                "role": "assistant",
+                "content": response.content,
+                "stopReason": response.stop_reason,
+            });
+            println!("{payload}");
+        }
+        Mode::Rpc => {
+            return Err("RPC mode is not implemented yet.".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ToolUse {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+fn extract_tool_uses(blocks: &[AnthropicContentBlock]) -> Vec<ToolUse> {
+    let mut uses = Vec::new();
+    for block in blocks {
+        if let AnthropicContentBlock::ToolUse { id, name, input } = block {
+            uses.push(ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            });
+        }
+    }
+    uses
+}
+
+fn execute_tool_use(
+    tool_use: &ToolUse,
+    tools: &[ToolDefinition],
+    ctx: &ToolContext,
+) -> AnthropicContentBlock {
+    let tool = tools.iter().find(|tool| tool.name == tool_use.name);
+    match tool {
+        Some(tool) => match (tool.execute)(&tool_use.input, ctx) {
+            Ok(output) => AnthropicContentBlock::ToolResult {
+                tool_use_id: tool_use.id.clone(),
+                content: vec![AnthropicToolResultContent::Text { text: output }],
+                is_error: false,
+            },
+            Err(message) => AnthropicContentBlock::ToolResult {
+                tool_use_id: tool_use.id.clone(),
+                content: vec![AnthropicToolResultContent::Text { text: message }],
+                is_error: true,
+            },
+        },
+        None => AnthropicContentBlock::ToolResult {
+            tool_use_id: tool_use.id.clone(),
+            content: vec![AnthropicToolResultContent::Text {
+                text: format!("Unknown tool: {}", tool_use.name),
+            }],
+            is_error: true,
+        },
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let parsed = parse_args(&args);
+
+    if parsed.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if parsed.help {
+        print_help();
+        return;
+    }
+
+    if let Some(list_models_mode) = &parsed.list_models {
+        let registry = match build_model_registry(None, None) {
+            Ok(registry) => registry,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                process::exit(1);
+            }
+        };
+        let search_pattern = match list_models_mode {
+            ListModels::All => None,
+            ListModels::Pattern(pattern) => Some(pattern.as_str()),
+        };
+        list_models(&registry, search_pattern);
+        return;
+    }
+
+    let unsupported = collect_unsupported_flags(&parsed);
+    if !unsupported.is_empty() {
+        eprintln!(
+            "Error: unsupported flag(s) in rust CLI: {}",
+            unsupported.join(", ")
+        );
+        process::exit(1);
+    }
+
+    let is_interactive = !parsed.print && parsed.mode.is_none();
+    if is_interactive {
+        eprintln!("Error: interactive mode is not implemented yet. Use --print or --mode.");
+        process::exit(1);
+    }
+
+    let mode = parsed.mode.clone().unwrap_or(Mode::Text);
+
+    let provider = parsed.provider.as_deref().unwrap_or("anthropic");
+    if provider != "anthropic" {
+        eprintln!("Error: unsupported provider \"{provider}\". Only \"anthropic\" is supported.");
+        process::exit(1);
+    }
+
+    let registry = match build_model_registry(parsed.api_key.as_deref(), Some(provider)) {
+        Ok(registry) => registry,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            process::exit(1);
+        }
+    };
+
+    let model = match select_model(&parsed, &registry) {
+        Ok(model) => model,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            process::exit(1);
+        }
+    };
+
+    if model.provider != "anthropic" {
+        eprintln!(
+            "Error: unsupported provider \"{}\". Only \"anthropic\" is supported.",
+            model.provider
+        );
+        process::exit(1);
+    }
+
+    let system_prompt_source = if parsed.system_prompt.is_some() {
+        parsed.system_prompt.clone()
+    } else {
+        discover_system_prompt_file().map(|path| path.to_string_lossy().to_string())
+    };
+    let system_prompt = resolve_prompt_input(system_prompt_source.as_deref(), "system prompt");
+    let append_system_prompt = resolve_prompt_input(
+        parsed.append_system_prompt.as_deref(),
+        "append system prompt",
+    );
+
+    if matches!(mode, Mode::Rpc) {
+        if !parsed.file_args.is_empty() {
+            eprintln!("Error: @file arguments are not supported in RPC mode.");
+            process::exit(1);
+        }
+        let session = match create_rpc_session(
+            model,
+            registry,
+            system_prompt,
+            append_system_prompt,
+            parsed.tools.as_deref(),
+            parsed.api_key.as_deref(),
+        ) {
+            Ok(session) => session,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                process::exit(1);
+            }
+        };
+        if let Err(message) = run_rpc_mode(session) {
+            eprintln!("Error: {message}");
+            process::exit(1);
+        }
+        return;
+    }
+
+    let mut messages = parsed.messages.clone();
+    let mut image_blocks = Vec::new();
+    if !parsed.file_args.is_empty() {
+        let inputs = match build_file_inputs(&parsed.file_args) {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                eprintln!("{message}");
+                process::exit(1);
+            }
+        };
+        if !inputs.text_prefix.is_empty() {
+            if messages.is_empty() {
+                messages.push(inputs.text_prefix);
+            } else {
+                messages[0] = format!("{}{}", inputs.text_prefix, messages[0]);
+            }
+        }
+        image_blocks = inputs.images;
+    }
+
+    if let Err(message) = run_print_mode(
+        mode,
+        &messages,
+        &model,
+        parsed.api_key.as_deref(),
+        PrintModeOptions {
+            tool_names: parsed.tools.as_deref(),
+            image_blocks: &image_blocks,
+            system_prompt,
+            append_system_prompt,
+        },
+    ) {
+        eprintln!("Error: {message}");
+        process::exit(1);
+    }
+}
+
+fn select_model(parsed: &Args, registry: &ModelRegistry) -> Result<RegistryModel, String> {
+    if let (Some(provider), Some(model_id)) = (&parsed.provider, &parsed.model) {
+        return registry
+            .find(provider, model_id)
+            .ok_or_else(|| format!("Model {provider}/{model_id} not found"));
+    }
+
+    if let Some(patterns) = &parsed.models {
+        let available = registry.get_available();
+        let scoped = pi::coding_agent::resolve_model_scope(patterns, &available);
+        if let Some(first) = scoped.first() {
+            return Ok(first.model.clone());
+        }
+        return Err(format!(
+            "No models match pattern(s): {}",
+            patterns.join(", ")
+        ));
+    }
+
+    let available = registry.get_available();
+    if let Some(model) = available
+        .iter()
+        .find(|model| model.provider == "anthropic" && model.id == "claude-opus-4-5")
+    {
+        return Ok(model.clone());
+    }
+
+    available
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No models available. Set an API key in auth.json or env.".to_string())
+}
+
+fn run_rpc_mode(mut session: pi::coding_agent::AgentSession) -> Result<(), String> {
+    let _unsubscribe = session.subscribe(|event| {
+        if let Some(value) = serialize_agent_event(event) {
+            emit_json(&value);
+        }
+    });
+
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => return Err(format!("Failed to read stdin: {err}")),
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(err) => {
+                emit_json(&response_error(
+                    None,
+                    "parse",
+                    &format!("Failed to parse command: {err}"),
+                ));
+                continue;
+            }
+        };
+
+        let envelope: RpcCommandEnvelope = match serde_json::from_value(value.clone()) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                emit_json(&response_error(
+                    None,
+                    "parse",
+                    &format!("Failed to parse command envelope: {err}"),
+                ));
+                continue;
+            }
+        };
+
+        if envelope.command_type == "hook_ui_response" {
+            continue;
+        }
+
+        handle_rpc_command(
+            &mut session,
+            envelope.command_type.as_str(),
+            value,
+            envelope.id,
+        );
+    }
+
+    Ok(())
+}
+
+fn handle_rpc_command(
+    session: &mut pi::coding_agent::AgentSession,
+    command_type: &str,
+    payload: Value,
+    id: Option<String>,
+) {
+    match command_type {
+        "prompt" => {
+            let command: RpcPromptCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(id.as_deref(), "prompt", &err.to_string()));
+                    return;
+                }
+            };
+            emit_json(&response_success(id.as_deref(), "prompt", None));
+
+            let mut handle_prompt = || {
+                if let Some(behavior) = command.streaming_behavior.as_deref() {
+                    if !command.images.is_empty() {
+                        return Err("streamingBehavior does not support images yet.".to_string());
+                    }
+                    match behavior {
+                        "steer" => {
+                            session.steer(&command.message);
+                            return Ok(());
+                        }
+                        "followUp" | "follow_up" => {
+                            session.follow_up(&command.message);
+                            return Ok(());
+                        }
+                        other => {
+                            return Err(format!(
+                                "Unknown streamingBehavior \"{other}\". Use \"steer\" or \"followUp\"."
+                            ));
+                        }
+                    }
+                }
+
+                if command.images.is_empty() {
+                    session
+                        .prompt(&command.message)
+                        .map_err(|err| err.to_string())
+                } else {
+                    let content = build_user_content(&command.message, &command.images)?;
+                    session
+                        .prompt_content(content)
+                        .map_err(|err| err.to_string())
+                }
+            };
+
+            if let Err(err) = handle_prompt() {
+                emit_json(&response_error(id.as_deref(), "prompt", &err));
+            }
+        }
+        "steer" => {
+            let command: RpcSteerCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(id.as_deref(), "steer", &err.to_string()));
+                    return;
+                }
+            };
+            session.steer(&command.message);
+            emit_json(&response_success(command.id.as_deref(), "steer", None));
+        }
+        "follow_up" => {
+            let command: RpcFollowUpCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "follow_up",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            session.follow_up(&command.message);
+            emit_json(&response_success(command.id.as_deref(), "follow_up", None));
+        }
+        "abort" => {
+            let command: RpcAbortCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(id.as_deref(), "abort", &err.to_string()));
+                    return;
+                }
+            };
+            session.abort();
+            emit_json(&response_success(command.id.as_deref(), "abort", None));
+        }
+        "new_session" => {
+            let command: RpcNewSessionCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "new_session",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let _ = command.parent_session;
+            session.new_session();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "new_session",
+                Some(json!({ "cancelled": false })),
+            ));
+        }
+        "get_state" => {
+            let command: RpcGetStateCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "get_state",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let state = session.get_state();
+            let value = json!({
+                "model": agent_model_value(&state.model),
+                "thinkingLevel": thinking_level_to_str(state.thinking_level),
+                "isStreaming": state.is_streaming,
+                "isCompacting": false,
+                "steeringMode": queue_mode_to_str(session.steering_mode()),
+                "followUpMode": queue_mode_to_str(session.follow_up_mode()),
+                "sessionFile": session.session_file().map(|path| path.to_string_lossy().to_string()),
+                "sessionId": session.session_id(),
+                "autoCompactionEnabled": session.auto_compaction_enabled(),
+                "messageCount": state.message_count,
+                "pendingMessageCount": session.pending_message_count(),
+            });
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "get_state",
+                Some(value),
+            ));
+        }
+        "set_thinking_level" => {
+            let command: RpcSetThinkingLevelCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "set_thinking_level",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let level = match thinking_level_from_str(&command.level) {
+                Some(level) => level,
+                None => {
+                    emit_json(&response_error(
+                        command.id.as_deref(),
+                        "set_thinking_level",
+                        "Invalid thinking level",
+                    ));
+                    return;
+                }
+            };
+            session.set_thinking_level(level);
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "set_thinking_level",
+                None,
+            ));
+        }
+        "cycle_thinking_level" => {
+            let command: RpcCycleThinkingLevelCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "cycle_thinking_level",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let result = session.cycle_thinking_level();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "cycle_thinking_level",
+                Some(json!({ "level": thinking_level_to_str(result.level) })),
+            ));
+        }
+        "set_steering_mode" => {
+            let command: RpcSetSteeringModeCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "set_steering_mode",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let mode = match queue_mode_from_str(&command.mode) {
+                Some(mode) => mode,
+                None => {
+                    emit_json(&response_error(
+                        command.id.as_deref(),
+                        "set_steering_mode",
+                        "Invalid steering mode",
+                    ));
+                    return;
+                }
+            };
+            session.set_steering_mode(mode);
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "set_steering_mode",
+                None,
+            ));
+        }
+        "set_follow_up_mode" => {
+            let command: RpcSetFollowUpModeCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "set_follow_up_mode",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let mode = match queue_mode_from_str(&command.mode) {
+                Some(mode) => mode,
+                None => {
+                    emit_json(&response_error(
+                        command.id.as_deref(),
+                        "set_follow_up_mode",
+                        "Invalid follow-up mode",
+                    ));
+                    return;
+                }
+            };
+            session.set_follow_up_mode(mode);
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "set_follow_up_mode",
+                None,
+            ));
+        }
+        "get_available_models" => {
+            let command: RpcGetAvailableModelsCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "get_available_models",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let models = session.get_available_models();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "get_available_models",
+                Some(json!({ "models": models })),
+            ));
+        }
+        "set_model" => {
+            let command: RpcSetModelCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "set_model",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let model = match session
+                .model_registry
+                .find(&command.provider, &command.model_id)
+            {
+                Some(model) => model,
+                None => {
+                    emit_json(&response_error(
+                        command.id.as_deref(),
+                        "set_model",
+                        "Model not found",
+                    ));
+                    return;
+                }
+            };
+            let agent_model = to_agent_model(&model);
+            session.set_model(agent_model);
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "set_model",
+                Some(json!(model)),
+            ));
+        }
+        "cycle_model" => {
+            let command: RpcCycleModelCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "cycle_model",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let result = session.cycle_model();
+            let data = result.map(|cycle| {
+                json!({
+                    "model": cycle.model,
+                    "thinkingLevel": thinking_level_to_str(cycle.thinking_level),
+                    "isScoped": cycle.is_scoped,
+                })
+            });
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "cycle_model",
+                Some(data.unwrap_or(Value::Null)),
+            ));
+        }
+        "compact" => {
+            let command: RpcCompactCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(id.as_deref(), "compact", &err.to_string()));
+                    return;
+                }
+            };
+            let _ = command.custom_instructions;
+            match session.compact() {
+                Ok(result) => emit_json(&response_success(
+                    command.id.as_deref(),
+                    "compact",
+                    Some(serde_json::to_value(result).unwrap_or(Value::Null)),
+                )),
+                Err(err) => emit_json(&response_error(
+                    command.id.as_deref(),
+                    "compact",
+                    &err.to_string(),
+                )),
+            }
+        }
+        "set_auto_compaction" => {
+            let command: RpcSetAutoCompactionCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "set_auto_compaction",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            session.set_auto_compaction_enabled(command.enabled);
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "set_auto_compaction",
+                None,
+            ));
+        }
+        "set_auto_retry" => {
+            let command: RpcSetAutoRetryCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "set_auto_retry",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            session.set_auto_retry_enabled(command.enabled);
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "set_auto_retry",
+                None,
+            ));
+        }
+        "abort_retry" => {
+            let command: RpcAbortRetryCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "abort_retry",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            session.abort_retry();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "abort_retry",
+                None,
+            ));
+        }
+        "get_session_stats" => {
+            let command: RpcGetSessionStatsCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "get_session_stats",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let stats = session.get_session_stats();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "get_session_stats",
+                Some(serde_json::to_value(stats).unwrap_or(Value::Null)),
+            ));
+        }
+        "export_html" => {
+            let command: RpcExportHtmlCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "export_html",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let output_path = command.output_path.map(PathBuf::from);
+            match session.export_to_html_with_path(output_path.as_ref()) {
+                Ok(result) => emit_json(&response_success(
+                    command.id.as_deref(),
+                    "export_html",
+                    Some(json!({ "path": result.path })),
+                )),
+                Err(err) => emit_json(&response_error(
+                    command.id.as_deref(),
+                    "export_html",
+                    &err.to_string(),
+                )),
+            }
+        }
+        "bash" => {
+            let command: RpcBashCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(id.as_deref(), "bash", &err.to_string()));
+                    return;
+                }
+            };
+            match session.execute_bash(&command.command) {
+                Ok(result) => emit_json(&response_success(
+                    command.id.as_deref(),
+                    "bash",
+                    Some(serde_json::to_value(result).unwrap_or(Value::Null)),
+                )),
+                Err(err) => emit_json(&response_error(
+                    command.id.as_deref(),
+                    "bash",
+                    &err.to_string(),
+                )),
+            }
+        }
+        "abort_bash" => {
+            let command: RpcAbortBashCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "abort_bash",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            session.abort_bash();
+            emit_json(&response_success(command.id.as_deref(), "abort_bash", None));
+        }
+        "switch_session" => {
+            let command: RpcSwitchSessionCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "switch_session",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let path = PathBuf::from(command.session_path);
+            match session.switch_session(path) {
+                Ok(cancelled) => emit_json(&response_success(
+                    command.id.as_deref(),
+                    "switch_session",
+                    Some(json!({ "cancelled": !cancelled })),
+                )),
+                Err(err) => emit_json(&response_error(
+                    command.id.as_deref(),
+                    "switch_session",
+                    &err.to_string(),
+                )),
+            }
+        }
+        "branch" => {
+            let command: RpcBranchCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(id.as_deref(), "branch", &err.to_string()));
+                    return;
+                }
+            };
+            match session.branch(&command.entry_id) {
+                Ok(result) => emit_json(&response_success(
+                    command.id.as_deref(),
+                    "branch",
+                    Some(json!({ "text": result.selected_text, "cancelled": result.cancelled })),
+                )),
+                Err(err) => emit_json(&response_error(
+                    command.id.as_deref(),
+                    "branch",
+                    &err.to_string(),
+                )),
+            }
+        }
+        "get_branch_messages" => {
+            let command: RpcGetBranchMessagesCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "get_branch_messages",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let messages = session
+                .get_user_messages_for_branching()
+                .into_iter()
+                .map(|message| json!({ "entryId": message.entry_id, "text": message.text }))
+                .collect::<Vec<_>>();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "get_branch_messages",
+                Some(json!({ "messages": messages })),
+            ));
+        }
+        "get_last_assistant_text" => {
+            let command: RpcGetLastAssistantTextCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "get_last_assistant_text",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let text = session.get_last_assistant_text();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "get_last_assistant_text",
+                Some(json!({ "text": text })),
+            ));
+        }
+        "get_messages" => {
+            let command: RpcGetMessagesCommand = match serde_json::from_value(payload) {
+                Ok(command) => command,
+                Err(err) => {
+                    emit_json(&response_error(
+                        id.as_deref(),
+                        "get_messages",
+                        &err.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let messages = session
+                .messages()
+                .into_iter()
+                .filter_map(|message| agent_message_to_core(&message))
+                .collect::<Vec<_>>();
+            emit_json(&response_success(
+                command.id.as_deref(),
+                "get_messages",
+                Some(json!({ "messages": messages })),
+            ));
+        }
+        _ => {
+            emit_json(&response_error(
+                id.as_deref(),
+                command_type,
+                "Unknown command",
+            ));
+        }
+    }
+}
+
+fn response_success(id: Option<&str>, command: &str, data: Option<Value>) -> Value {
+    match data {
+        Some(data) => json!({
+            "id": id,
+            "type": "response",
+            "command": command,
+            "success": true,
+            "data": data
+        }),
+        None => json!({
+            "id": id,
+            "type": "response",
+            "command": command,
+            "success": true
+        }),
+    }
+}
+
+fn response_error(id: Option<&str>, command: &str, error: &str) -> Value {
+    json!({
+        "id": id,
+        "type": "response",
+        "command": command,
+        "success": false,
+        "error": error
+    })
+}
+
+fn emit_json(value: &Value) {
+    let mut stdout = io::stdout().lock();
+    let _ = writeln!(stdout, "{value}");
+    let _ = stdout.flush();
+}
+
+fn serialize_agent_event(event: &pi::coding_agent::AgentSessionEvent) -> Option<Value> {
+    match event {
+        pi::coding_agent::AgentSessionEvent::Agent(agent_event) => match agent_event.as_ref() {
+            pi::agent::AgentEvent::AgentStart => Some(json!({ "type": "agent_start" })),
+            pi::agent::AgentEvent::AgentEnd { messages } => Some(json!({
+                "type": "agent_end",
+                "messages": messages.iter().filter_map(agent_message_to_core).collect::<Vec<_>>()
+            })),
+            pi::agent::AgentEvent::TurnStart => Some(json!({ "type": "turn_start" })),
+            pi::agent::AgentEvent::TurnEnd {
+                message,
+                tool_results,
+            } => Some(json!({
+                "type": "turn_end",
+                "message": agent_message_to_core(message),
+                "toolResults": tool_results
+            })),
+            pi::agent::AgentEvent::MessageStart { message } => Some(json!({
+                "type": "message_start",
+                "message": agent_message_to_core(message),
+            })),
+            pi::agent::AgentEvent::MessageUpdate { message } => Some(json!({
+                "type": "message_update",
+                "message": agent_message_to_core(message),
+            })),
+            pi::agent::AgentEvent::MessageEnd { message } => Some(json!({
+                "type": "message_end",
+                "message": agent_message_to_core(message),
+            })),
+            pi::agent::AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => Some(json!({
+                "type": "tool_execution_start",
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "args": args
+            })),
+            pi::agent::AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+            } => Some(json!({
+                "type": "tool_execution_update",
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "args": args,
+                "partialResult": agent_tool_result_value(partial_result),
+            })),
+            pi::agent::AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => Some(json!({
+                "type": "tool_execution_end",
+                "toolCallId": tool_call_id,
+                "toolName": tool_name,
+                "result": agent_tool_result_value(result),
+                "isError": is_error,
+            })),
+        },
+        pi::coding_agent::AgentSessionEvent::AutoCompactionStart { reason } => {
+            Some(json!({ "type": "auto_compaction_start", "reason": reason }))
+        }
+        pi::coding_agent::AgentSessionEvent::AutoCompactionEnd { aborted } => {
+            Some(json!({ "type": "auto_compaction_end", "aborted": aborted }))
+        }
+    }
+}
+
+fn agent_tool_result_value(result: &AgentToolResult) -> Value {
+    json!({
+        "content": result.content,
+        "details": result.details,
+    })
+}
+
+fn agent_message_to_core(message: &AgentMessage) -> Option<CoreAgentMessage> {
+    match message {
+        AgentMessage::User(user) => Some(CoreAgentMessage::User(user.clone())),
+        AgentMessage::Assistant(assistant) => Some(CoreAgentMessage::Assistant(assistant.clone())),
+        AgentMessage::ToolResult(result) => Some(CoreAgentMessage::ToolResult(result.clone())),
+        AgentMessage::Custom(custom) => Some(CoreAgentMessage::HookMessage(
+            pi::core::messages::HookMessage {
+                custom_type: custom.role.clone(),
+                content: UserContent::Text(custom.text.clone()),
+                display: true,
+                details: None,
+                timestamp: custom.timestamp,
+            },
+        )),
+    }
+}
+
+fn queue_mode_from_str(mode: &str) -> Option<QueueMode> {
+    match mode {
+        "all" => Some(QueueMode::All),
+        "one-at-a-time" => Some(QueueMode::OneAtATime),
+        _ => None,
+    }
+}
+
+fn queue_mode_to_str(mode: QueueMode) -> &'static str {
+    match mode {
+        QueueMode::All => "all",
+        QueueMode::OneAtATime => "one-at-a-time",
+    }
+}
+
+fn thinking_level_from_str(level: &str) -> Option<ThinkingLevel> {
+    match level {
+        "off" => Some(ThinkingLevel::Off),
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "low" => Some(ThinkingLevel::Low),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        "xhigh" => Some(ThinkingLevel::XHigh),
+        _ => None,
+    }
+}
+
+fn thinking_level_to_str(level: ThinkingLevel) -> &'static str {
+    level.as_str()
+}
+
+fn agent_model_value(model: &AgentModel) -> Value {
+    json!({
+        "id": model.id,
+        "name": model.name,
+        "api": model.api,
+        "provider": model.provider,
+    })
+}
+
+fn build_user_content(message: &str, images: &[RpcImage]) -> Result<UserContent, String> {
+    let mut blocks = Vec::new();
+    if !message.trim().is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: message.to_string(),
+            text_signature: None,
+        });
+    }
+    for image in images {
+        blocks.push(ContentBlock::Image {
+            data: image.data.clone(),
+            mime_type: image.mime_type.clone(),
+        });
+    }
+    if blocks.is_empty() {
+        return Err("No prompt content provided.".to_string());
+    }
+    Ok(UserContent::Blocks(blocks))
+}
+
+fn to_agent_model(model: &RegistryModel) -> AgentModel {
+    AgentModel {
+        id: model.id.clone(),
+        name: model.name.clone(),
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+    }
+}
+
+fn build_agent_tools(
+    cwd: &PathBuf,
+    tool_names: Option<&[String]>,
+) -> Result<Vec<AgentTool>, String> {
+    let available = ["read", "write", "edit", "bash", "grep", "find", "ls"];
+    let selected = match tool_names {
+        Some(names) => {
+            for name in names {
+                if !available.iter().any(|item| item == name) {
+                    return Err(format!("Tool \"{name}\" is not supported in RPC mode"));
+                }
+            }
+            names.to_vec()
+        }
+        None => available.iter().map(|name| name.to_string()).collect(),
+    };
+
+    let mut tools = Vec::new();
+    for name in selected {
+        match name.as_str() {
+            "read" => {
+                let tool = agent_tools::ReadTool::new(cwd);
+                tools.push(AgentTool {
+                    name: "read".to_string(),
+                    label: "read".to_string(),
+                    description: "Read file contents".to_string(),
+                    execute: Rc::new(move |call_id, params| {
+                        let args = parse_read_args(params)?;
+                        let result = tool.execute(call_id, args)?;
+                        Ok(tool_result_to_agent_result(result))
+                    }),
+                });
+            }
+            "write" => {
+                let tool = agent_tools::WriteTool::new(cwd);
+                tools.push(AgentTool {
+                    name: "write".to_string(),
+                    label: "write".to_string(),
+                    description: "Write file contents".to_string(),
+                    execute: Rc::new(move |call_id, params| {
+                        let args = parse_write_args(params)?;
+                        let result = tool.execute(call_id, args)?;
+                        Ok(tool_result_to_agent_result(result))
+                    }),
+                });
+            }
+            "edit" => {
+                let tool = agent_tools::EditTool::new(cwd);
+                tools.push(AgentTool {
+                    name: "edit".to_string(),
+                    label: "edit".to_string(),
+                    description: "Edit file contents".to_string(),
+                    execute: Rc::new(move |call_id, params| {
+                        let args = parse_edit_args(params)?;
+                        let result = tool.execute(call_id, args)?;
+                        Ok(tool_result_to_agent_result(result))
+                    }),
+                });
+            }
+            "bash" => {
+                let tool = agent_tools::BashTool::new(cwd);
+                tools.push(AgentTool {
+                    name: "bash".to_string(),
+                    label: "bash".to_string(),
+                    description: "Execute bash commands".to_string(),
+                    execute: Rc::new(move |call_id, params| {
+                        let args = parse_bash_args(params)?;
+                        let result = tool.execute(call_id, args)?;
+                        Ok(tool_result_to_agent_result(result))
+                    }),
+                });
+            }
+            "grep" => {
+                let tool = agent_tools::GrepTool::new(cwd);
+                tools.push(AgentTool {
+                    name: "grep".to_string(),
+                    label: "grep".to_string(),
+                    description: "Search file contents".to_string(),
+                    execute: Rc::new(move |call_id, params| {
+                        let args = parse_grep_args(params)?;
+                        let result = tool.execute(call_id, args)?;
+                        Ok(tool_result_to_agent_result(result))
+                    }),
+                });
+            }
+            "find" => {
+                let tool = agent_tools::FindTool::new(cwd);
+                tools.push(AgentTool {
+                    name: "find".to_string(),
+                    label: "find".to_string(),
+                    description: "Find files by pattern".to_string(),
+                    execute: Rc::new(move |call_id, params| {
+                        let args = parse_find_args(params)?;
+                        let result = tool.execute(call_id, args)?;
+                        Ok(tool_result_to_agent_result(result))
+                    }),
+                });
+            }
+            "ls" => {
+                let tool = agent_tools::LsTool::new(cwd);
+                tools.push(AgentTool {
+                    name: "ls".to_string(),
+                    label: "ls".to_string(),
+                    description: "List directory contents".to_string(),
+                    execute: Rc::new(move |call_id, params| {
+                        let args = parse_ls_args(params)?;
+                        let result = tool.execute(call_id, args)?;
+                        Ok(tool_result_to_agent_result(result))
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(tools)
+}
+
+fn parse_read_args(params: &Value) -> Result<agent_tools::ReadToolArgs, String> {
+    Ok(agent_tools::ReadToolArgs {
+        path: get_required_string(params, "path")?,
+        offset: get_optional_usize(params, "offset"),
+        limit: get_optional_usize(params, "limit"),
+    })
+}
+
+fn parse_write_args(params: &Value) -> Result<agent_tools::WriteToolArgs, String> {
+    Ok(agent_tools::WriteToolArgs {
+        path: get_required_string(params, "path")?,
+        content: get_required_string(params, "content")?,
+    })
+}
+
+fn parse_edit_args(params: &Value) -> Result<agent_tools::EditToolArgs, String> {
+    Ok(agent_tools::EditToolArgs {
+        path: get_required_string(params, "path")?,
+        old_text: get_required_string(params, "oldText")?,
+        new_text: get_required_string(params, "newText")?,
+    })
+}
+
+fn parse_bash_args(params: &Value) -> Result<agent_tools::BashToolArgs, String> {
+    Ok(agent_tools::BashToolArgs {
+        command: get_required_string(params, "command")?,
+        timeout: get_optional_u64(params, "timeout"),
+    })
+}
+
+fn parse_grep_args(params: &Value) -> Result<agent_tools::GrepToolArgs, String> {
+    Ok(agent_tools::GrepToolArgs {
+        pattern: get_required_string(params, "pattern")?,
+        path: get_optional_string(params, "path"),
+        glob: get_optional_string(params, "glob"),
+        ignore_case: get_optional_bool(params, "ignoreCase"),
+        literal: get_optional_bool(params, "literal"),
+        context: get_optional_usize(params, "context"),
+        limit: get_optional_usize(params, "limit"),
+    })
+}
+
+fn parse_find_args(params: &Value) -> Result<agent_tools::FindToolArgs, String> {
+    Ok(agent_tools::FindToolArgs {
+        pattern: get_required_string(params, "pattern")?,
+        path: get_optional_string(params, "path"),
+        limit: get_optional_usize(params, "limit"),
+    })
+}
+
+fn parse_ls_args(params: &Value) -> Result<agent_tools::LsToolArgs, String> {
+    Ok(agent_tools::LsToolArgs {
+        path: get_optional_string(params, "path"),
+        limit: get_optional_usize(params, "limit"),
+    })
+}
+
+fn get_required_string(params: &Value, key: &str) -> Result<String, String> {
+    params
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .ok_or_else(|| format!("Missing or invalid \"{}\" argument", key))
+}
+
+fn get_optional_string(params: &Value, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn get_optional_bool(params: &Value, key: &str) -> Option<bool> {
+    params.get(key).and_then(|value| value.as_bool())
+}
+
+fn get_optional_usize(params: &Value, key: &str) -> Option<usize> {
+    params
+        .get(key)
+        .and_then(|value| value.as_i64())
+        .and_then(|value| {
+            if value < 0 {
+                None
+            } else {
+                Some(value as usize)
+            }
+        })
+}
+
+fn get_optional_u64(params: &Value, key: &str) -> Option<u64> {
+    params
+        .get(key)
+        .and_then(|value| value.as_i64())
+        .and_then(|value| if value < 0 { None } else { Some(value as u64) })
+}
+
+fn tool_result_to_agent_result(result: agent_tools::ToolResult) -> AgentToolResult {
+    AgentToolResult {
+        content: result.content,
+        details: result.details.unwrap_or(Value::Null),
+    }
+}
+
+fn build_anthropic_tool_specs(tool_names: Option<&[String]>) -> Result<Vec<AnthropicTool>, String> {
+    let mut tool_defs = default_tools();
+    if let Some(tool_names) = tool_names {
+        let missing = tool_names
+            .iter()
+            .filter(|name| !tool_defs.iter().any(|tool| tool.name == name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "Tool(s) not implemented yet: {}",
+                missing.join(", ")
+            ));
+        }
+        tool_defs.retain(|tool| tool_names.iter().any(|name| name == tool.name));
+    }
+    Ok(tool_defs
+        .into_iter()
+        .map(|tool| AnthropicTool {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+            input_schema: tool.input_schema,
+        })
+        .collect())
+}
+
+fn build_stream_fn(
+    model: RegistryModel,
+    api_key: String,
+    use_oauth: bool,
+    tool_specs: Vec<AnthropicTool>,
+) -> AgentStreamFn {
+    Box::new(move |_agent_model, context| {
+        let system = if !context.system_prompt.trim().is_empty() {
+            Some(context.system_prompt.as_str())
+        } else if use_oauth {
+            Some(DEFAULT_OAUTH_SYSTEM_PROMPT)
+        } else {
+            None
+        };
+
+        let messages = build_anthropic_messages(context);
+        let response = call_anthropic(
+            messages,
+            AnthropicCallOptions {
+                model: &model.id,
+                api_key: &api_key,
+                use_oauth,
+                tools: &tool_specs,
+                base_url: if model.base_url.is_empty() {
+                    "https://api.anthropic.com/v1"
+                } else {
+                    model.base_url.as_str()
+                },
+                extra_headers: model.headers.as_ref(),
+                system,
+            },
+        );
+
+        match response {
+            Ok(response) => assistant_message_from_anthropic(&model, response),
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
+fn create_rpc_session(
+    model: RegistryModel,
+    registry: ModelRegistry,
+    system_prompt: Option<String>,
+    append_system_prompt: Option<String>,
+    tool_names: Option<&[String]>,
+    api_key_override: Option<&str>,
+) -> Result<AgentSession, String> {
+    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
+    let tool_specs = build_anthropic_tool_specs(tool_names)?;
+    let stream_fn = build_stream_fn(model.clone(), api_key, use_oauth, tool_specs);
+    let cwd = env::current_dir().map_err(|err| err.to_string())?;
+    let agent_tools = build_agent_tools(&cwd, tool_names)?;
+
+    let mut system = system_prompt.or_else(|| {
+        if use_oauth {
+            Some(DEFAULT_OAUTH_SYSTEM_PROMPT.to_string())
+        } else {
+            None
+        }
+    });
+    if let Some(append) = append_system_prompt {
+        system = Some(match system {
+            Some(base) => format!("{base}\n\n{append}"),
+            None => append,
+        });
+    }
+    let system_value = system.unwrap_or_default();
+
+    let agent_model = to_agent_model(&model);
+    let agent = Agent::new(AgentOptions {
+        initial_state: Some(AgentStateOverride {
+            system_prompt: Some(system_value),
+            model: Some(agent_model),
+            tools: Some(agent_tools),
+            ..Default::default()
+        }),
+        stream_fn: Some(stream_fn),
+        ..Default::default()
+    });
+
+    let session_manager = SessionManager::in_memory();
+    let settings_manager = SettingsManager::create("", "");
+
+    Ok(AgentSession::new(AgentSessionConfig {
+        agent,
+        session_manager,
+        settings_manager,
+        model_registry: registry,
+    }))
+}
+
+fn build_anthropic_messages(context: &LlmContext) -> Vec<AnthropicMessage> {
+    let mut messages = Vec::new();
+    for message in &context.messages {
+        match message {
+            AgentMessage::User(user) => {
+                let content = user_content_to_anthropic_blocks(&user.content);
+                messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content,
+                });
+            }
+            AgentMessage::Assistant(assistant) => {
+                let content = assistant_blocks_to_anthropic_blocks(&assistant.content);
+                messages.push(AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content,
+                });
+            }
+            AgentMessage::ToolResult(result) => {
+                let content = tool_result_to_anthropic_blocks(result);
+                messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content,
+                });
+            }
+            AgentMessage::Custom(_) => {}
+        }
+    }
+    messages
+}
+
+fn user_content_to_anthropic_blocks(content: &UserContent) -> Vec<AnthropicContentBlock> {
+    match content {
+        UserContent::Text(text) => vec![AnthropicContentBlock::Text { text: text.clone() }],
+        UserContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => {
+                    Some(AnthropicContentBlock::Text { text: text.clone() })
+                }
+                ContentBlock::Image { data, mime_type } => Some(AnthropicContentBlock::Image {
+                    source: AnthropicImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: mime_type.clone(),
+                        data: data.clone(),
+                    },
+                }),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn assistant_blocks_to_anthropic_blocks(blocks: &[ContentBlock]) -> Vec<AnthropicContentBlock> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text, .. } => AnthropicContentBlock::Text { text: text.clone() },
+            ContentBlock::Thinking { thinking, .. } => AnthropicContentBlock::Text {
+                text: thinking.clone(),
+            },
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => AnthropicContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: arguments.clone(),
+            },
+            ContentBlock::Image { data, mime_type } => AnthropicContentBlock::Image {
+                source: AnthropicImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: mime_type.clone(),
+                    data: data.clone(),
+                },
+            },
+        })
+        .collect()
+}
+
+fn tool_result_to_anthropic_blocks(result: &ToolResultMessage) -> Vec<AnthropicContentBlock> {
+    let content = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => {
+                Some(AnthropicToolResultContent::Text { text: text.clone() })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    vec![AnthropicContentBlock::ToolResult {
+        tool_use_id: result.tool_call_id.clone(),
+        content,
+        is_error: result.is_error,
+    }]
+}
+
+fn assistant_message_from_anthropic(
+    model: &RegistryModel,
+    response: AnthropicResponse,
+) -> AssistantMessage {
+    let content = response
+        .content
+        .into_iter()
+        .filter_map(|block| match block {
+            AnthropicContentBlock::Text { text } => Some(ContentBlock::Text {
+                text,
+                text_signature: None,
+            }),
+            AnthropicContentBlock::ToolUse { id, name, input } => Some(ContentBlock::ToolCall {
+                id,
+                name,
+                arguments: input,
+                thought_signature: None,
+            }),
+            AnthropicContentBlock::Image { source } => Some(ContentBlock::Image {
+                data: source.data,
+                mime_type: source.media_type,
+            }),
+            AnthropicContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>();
+
+    AssistantMessage {
+        content,
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        usage: empty_usage(),
+        stop_reason: response.stop_reason.unwrap_or_else(|| "stop".to_string()),
+        error_message: None,
+        timestamp: now_millis(),
+    }
+}
+
+fn assistant_error_message(model: &RegistryModel, message: &str) -> AssistantMessage {
+    AssistantMessage {
+        content: vec![ContentBlock::Text {
+            text: message.to_string(),
+            text_signature: None,
+        }],
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        usage: empty_usage(),
+        stop_reason: "error".to_string(),
+        error_message: Some(message.to_string()),
+        timestamp: now_millis(),
+    }
+}
+
+fn empty_usage() -> Usage {
+    Usage {
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        cache_write: 0,
+        total_tokens: Some(0),
+        cost: Some(Cost {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            total: 0.0,
+        }),
+    }
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
+    let png_magic: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if data.len() >= png_magic.len() && data[..png_magic.len()] == png_magic {
+        return Some("image/png");
+    }
+
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return Some("image/jpeg");
+    }
+
+    if data.len() >= 6 {
+        let header = &data[..6];
+        if header == b"GIF87a" || header == b"GIF89a" {
+            return Some("image/gif");
+        }
+    }
+
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+
+    None
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = if i + 1 < data.len() { data[i + 1] } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] } else { 0 };
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[((b0 & 0x03) << 4 | (b1 >> 4)) as usize] as char);
+        if i + 1 < data.len() {
+            output.push(TABLE[((b1 & 0x0f) << 2 | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if i + 2 < data.len() {
+            output.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        i += 3;
+    }
+    output
+}

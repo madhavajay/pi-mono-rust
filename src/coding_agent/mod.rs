@@ -1,0 +1,34 @@
+pub mod fuzzy;
+pub mod tools;
+
+pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
+pub mod agent_session;
+pub mod auth_storage;
+pub mod hooks;
+pub mod interactive_mode;
+pub mod model_registry;
+pub mod model_resolver;
+pub mod skills;
+pub mod slash_commands;
+
+pub use agent_session::{
+    AgentSession, AgentSessionConfig, AgentSessionError, AgentSessionEvent, AgentSessionState,
+    BashResult, BranchCandidate, BranchResult, CompactionOverrides, ExportResult, ModelCycleResult,
+    NavigateTreeOptions, NavigateTreeResult, SessionStats, SettingsManager, SettingsOverrides,
+    ThinkingLevelCycleResult, TokenStats,
+};
+pub use auth_storage::{AuthCredential, AuthStorage};
+pub use hooks::{
+    CompactionHook, CompactionResult, HookAPI, HookContext, SessionBeforeCompactEvent,
+    SessionBeforeCompactResult, SessionCompactEvent,
+};
+pub use interactive_mode::InteractiveMode;
+pub use model_registry::{Model, ModelRegistry};
+pub use model_resolver::{
+    parse_model_pattern, resolve_model_scope, InitialModelResult, ParsedModelResult, ScopedModel,
+};
+pub use skills::{
+    format_skills_for_prompt, load_skills, load_skills_from_dir, LoadSkillsFromDirOptions,
+    LoadSkillsOptions, LoadSkillsResult, Skill, SkillWarning,
+};
+pub use slash_commands::{parse_command_args, substitute_args};
