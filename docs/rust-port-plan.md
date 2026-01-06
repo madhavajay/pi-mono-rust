@@ -134,6 +134,7 @@ Planned modules (initial, not final):
 - CLI `--thinking` sets the initial thinking level and persists it to the session.
 - RPC prompt streamingBehavior now matches TS (only queues when streaming; images are ignored during queueing).
 - Interactive mode now supports a basic line-based REPL (full TUI pending).
+- CLI `--resume` now lists available sessions and prompts for a selection in the line-based UI.
 
 ## Test Plan
 ### Baseline (TS)

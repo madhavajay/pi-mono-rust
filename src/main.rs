@@ -13,7 +13,7 @@ use pi::core::messages::{
     AgentMessage as CoreAgentMessage, AssistantMessage, ContentBlock, Cost, ToolResultMessage,
     Usage, UserContent,
 };
-use pi::core::session_manager::SessionManager;
+use pi::core::session_manager::{SessionInfo, SessionManager};
 use pi::tools::{default_tools, ToolDefinition};
 use pi::{parse_args, Args, ListModels, Mode};
 use reqwest::blocking::Client;
@@ -59,16 +59,13 @@ Options:
 
 Notes:
   Interactive mode is line-based (full TUI pending).
-  --resume, --hook, --tool are not implemented yet."
+  --hook and --tool are not implemented yet."
     );
 }
 
 fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
     let mut unsupported = Vec::new();
 
-    if parsed.resume {
-        unsupported.push("--resume");
-    }
     if parsed.hooks.is_some() {
         unsupported.push("--hook");
     }
@@ -1249,6 +1246,83 @@ fn build_session_manager(parsed: &Args, cwd: &Path) -> SessionManager {
     SessionManager::create(cwd.to_path_buf())
 }
 
+fn select_resume_session(cwd: &Path, session_dir: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let sessions = SessionManager::list(cwd, session_dir.map(PathBuf::from));
+    if sessions.is_empty() {
+        println!("No sessions found");
+        return Ok(None);
+    }
+
+    let selection = prompt_for_session(&sessions)?;
+    if selection.is_none() {
+        println!("No session selected");
+    }
+    Ok(selection)
+}
+
+fn prompt_for_session(sessions: &[SessionInfo]) -> Result<Option<PathBuf>, String> {
+    println!("Select a session to resume:");
+    for (idx, session) in sessions.iter().enumerate() {
+        let preview = truncate_preview(&session.first_message, 80);
+        let modified = format_modified_time(session.modified);
+        println!(
+            "{:>2}) {} (messages: {}, modified: {})",
+            idx + 1,
+            preview,
+            session.message_count,
+            modified
+        );
+    }
+
+    loop {
+        print!("Enter number to resume (or press Enter to cancel): ");
+        io::stdout()
+            .flush()
+            .map_err(|err| format!("Failed to prompt: {err}"))?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|err| format!("Failed to read input: {err}"))?;
+        let trimmed = input.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("q")
+            || trimmed.eq_ignore_ascii_case("quit")
+        {
+            return Ok(None);
+        }
+        let parsed = trimmed.parse::<usize>();
+        let Ok(index) = parsed else {
+            println!(
+                "Invalid selection. Enter a number between 1 and {}.",
+                sessions.len()
+            );
+            continue;
+        };
+        if index == 0 || index > sessions.len() {
+            println!(
+                "Invalid selection. Enter a number between 1 and {}.",
+                sessions.len()
+            );
+            continue;
+        }
+        return Ok(Some(sessions[index - 1].path.clone()));
+    }
+}
+
+fn format_modified_time(time: std::time::SystemTime) -> String {
+    let datetime: chrono::DateTime<chrono::Local> = time.into();
+    datetime.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn truncate_preview(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        return text.to_string();
+    }
+    let mut truncated = text.chars().take(max_len).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 fn cli_thinking_level(level: &CliThinkingLevel) -> ThinkingLevel {
     match level {
         CliThinkingLevel::Off => ThinkingLevel::Off,
@@ -1384,7 +1458,18 @@ fn main() {
         agent_dir: get_agent_dir(),
         ..Default::default()
     });
-    let session_manager = build_session_manager(&parsed, &cwd);
+    let session_manager = if parsed.resume {
+        match select_resume_session(&cwd, parsed.session_dir.as_deref()) {
+            Ok(Some(path)) => SessionManager::open(path, None),
+            Ok(None) => return,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                process::exit(1);
+            }
+        }
+    } else {
+        build_session_manager(&parsed, &cwd)
+    };
 
     if matches!(mode, Mode::Rpc) {
         if !parsed.file_args.is_empty() {

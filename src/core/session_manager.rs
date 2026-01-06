@@ -10,6 +10,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 pub const CURRENT_SESSION_VERSION: i64 = 2;
@@ -176,6 +177,17 @@ pub struct SessionContext {
     pub messages: Vec<AgentMessage>,
     pub thinking_level: String,
     pub model: Option<ModelRef>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub id: String,
+    pub created: String,
+    pub modified: SystemTime,
+    pub message_count: usize,
+    pub first_message: String,
+    pub all_messages_text: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -683,6 +695,100 @@ impl SessionManager {
             return SessionManager::new(cwd, dir, Some(path), true);
         }
         SessionManager::new(cwd, dir, None, true)
+    }
+
+    pub fn list(cwd: &Path, session_dir: Option<PathBuf>) -> Vec<SessionInfo> {
+        let dir = session_dir.unwrap_or_else(|| get_default_session_dir(cwd));
+        let mut sessions = Vec::new();
+
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return sessions,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            let mut lines = content.lines();
+            let header_line = match lines.next() {
+                Some(line) => line,
+                None => continue,
+            };
+            let header_value: Value = match serde_json::from_str(header_line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let header_type = header_value.get("type").and_then(Value::as_str);
+            let header_id = header_value.get("id").and_then(Value::as_str);
+            let header_timestamp = header_value.get("timestamp").and_then(Value::as_str);
+            if header_type != Some("session") || header_id.is_none() || header_timestamp.is_none() {
+                continue;
+            }
+
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let mut message_count = 0usize;
+            let mut first_message = String::new();
+            let mut all_messages = Vec::new();
+
+            for line in lines {
+                let entry: Value = match serde_json::from_str(line) {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                if entry.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
+                message_count += 1;
+                let message = match entry.get("message") {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let role = message.get("role").and_then(Value::as_str);
+                if role != Some("user") && role != Some("assistant") {
+                    continue;
+                }
+
+                let content = message.get("content");
+                let text = extract_message_text(content);
+                if text.is_empty() {
+                    continue;
+                }
+                if first_message.is_empty() && role == Some("user") {
+                    first_message = text.clone();
+                }
+                all_messages.push(text);
+            }
+
+            let first_message = if first_message.is_empty() {
+                "(no messages)".to_string()
+            } else {
+                first_message
+            };
+
+            sessions.push(SessionInfo {
+                path,
+                id: header_id.unwrap_or_default().to_string(),
+                created: header_timestamp.unwrap_or_default().to_string(),
+                modified,
+                message_count,
+                first_message,
+                all_messages_text: all_messages.join(" "),
+            });
+        }
+
+        sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+        sessions
     }
 
     fn new(
@@ -1273,6 +1379,29 @@ impl SessionEntry {
             SessionEntry::CustomMessage(entry) => FileEntry::CustomMessage(entry.clone()),
             SessionEntry::Label(entry) => FileEntry::Label(entry.clone()),
         }
+    }
+}
+
+fn extract_message_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(Value::as_str) != Some("text") {
+                    return None;
+                }
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| text.to_string())
+            })
+            .collect::<Vec<String>>()
+            .join(" "),
+        _ => String::new(),
     }
 }
 
