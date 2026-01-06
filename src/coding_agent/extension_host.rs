@@ -72,6 +72,7 @@ pub struct ExtensionMetadata {
 pub struct ExtensionHostError {
     pub extension_path: String,
     pub error: String,
+    pub event: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +149,7 @@ struct ExtensionEventPayload<'a> {
     branch_entries: Option<&'a [SessionEntry]>,
     compaction_entry: Option<&'a crate::core::session_manager::CompactionEntry>,
     from_extension: Option<bool>,
+    messages: Option<&'a [AgentMessage]>,
 }
 
 #[derive(Serialize)]
@@ -284,15 +286,10 @@ impl ExtensionHost {
             branch_entries: Some(&event.branch_entries),
             compaction_entry: None,
             from_extension: None,
+            messages: None,
         };
         let context = self.build_context(&event.branch_entries);
-        let request = EmitRequest {
-            id: self.next_id(),
-            kind: "emit",
-            event: &payload,
-            context,
-        };
-        let response = self.send_request(request)?;
+        let response = self.emit_event(&payload, context)?;
         if !response.ok {
             return Err(response
                 .error
@@ -314,21 +311,38 @@ impl ExtensionHost {
             branch_entries: None,
             compaction_entry: Some(&event.compaction_entry),
             from_extension: Some(event.from_hook),
+            messages: None,
         };
         let context = self.build_context(&[]);
-        let request = EmitRequest {
-            id: self.next_id(),
-            kind: "emit",
-            event: &payload,
-            context,
-        };
-        let response = self.send_request(request)?;
+        let response = self.emit_event(&payload, context)?;
         if !response.ok {
             return Err(response
                 .error
                 .unwrap_or_else(|| "Extension host emit failed".to_string()));
         }
         Ok(())
+    }
+
+    pub fn emit_context(
+        &mut self,
+        messages: &[AgentMessage],
+    ) -> Result<Vec<ExtensionHostError>, String> {
+        let payload = ExtensionEventPayload {
+            kind: "context",
+            preparation: None,
+            branch_entries: None,
+            compaction_entry: None,
+            from_extension: None,
+            messages: Some(messages),
+        };
+        let context = self.build_context(&[]);
+        let response = self.emit_event(&payload, context)?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "Extension host emit failed".to_string()));
+        }
+        Ok(response.errors.unwrap_or_default())
     }
 
     pub fn set_flag_values(&mut self, flags: &HashMap<String, Value>) -> Result<(), String> {
@@ -381,6 +395,20 @@ impl ExtensionHost {
         }
         serde_json::from_str(&response_line)
             .map_err(|err| format!("Failed to parse extension response: {err}"))
+    }
+
+    fn emit_event(
+        &mut self,
+        payload: &ExtensionEventPayload<'_>,
+        context: ExtensionContextPayload,
+    ) -> Result<HostResponse, String> {
+        let request = EmitRequest {
+            id: self.next_id(),
+            kind: "emit",
+            event: payload,
+            context,
+        };
+        self.send_request(request)
     }
 
     fn next_id(&mut self) -> u64 {

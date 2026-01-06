@@ -144,6 +144,7 @@ Planned modules (initial, not final):
 - CLI now parses `--extension`/`-e` and persists extension paths to settings; JS extensions can now run compaction hooks via the Node host (TS support pending).
 - Extension discovery now scans global/project directories plus configured paths and hands JS/TS extensions to the host (TS uses `jiti` when available).
 - CLI now parses extension-defined flags and passes flag values into the JS extension host (`getFlag` supported).
+- Added a Rust-side extension runner for JS extension metadata (tools/commands/flags/shortcuts/renderers), shortcut conflict warnings, context event emit, and error listeners.
 
 ## Test Plan
 ### Baseline (TS)
