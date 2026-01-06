@@ -16,6 +16,7 @@ use pi::core::messages::{
 };
 use pi::core::session_manager::{SessionInfo, SessionManager};
 use pi::tools::{default_tools, ToolDefinition};
+use pi::tui::{truncate_to_width, wrap_text_with_ansi, Editor, EditorTheme};
 use pi::{parse_args, Args, ListModels, Mode};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -27,6 +28,11 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::rc::Rc;
+
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::ExecutableCommand;
 
 const DEFAULT_OAUTH_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -60,7 +66,7 @@ Options:
   @file            Include file contents in prompt (text or images)
 
 Notes:
-  Interactive mode is line-based (full TUI pending).
+  Interactive mode uses a basic TUI (full parity pending).
   Extension execution is not implemented yet in the Rust port."
     );
 }
@@ -909,52 +915,320 @@ fn run_print_mode_session(
     Ok(())
 }
 
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter(stdout: &mut impl Write) -> Result<Self, String> {
+        terminal::enable_raw_mode().map_err(|err| err.to_string())?;
+        stdout
+            .execute(EnterAlternateScreen)
+            .map_err(|err| err.to_string())?;
+        stdout.execute(Hide).map_err(|err| err.to_string())?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = stdout.execute(LeaveAlternateScreen);
+        let _ = stdout.execute(Show);
+    }
+}
+
+enum EditorAction {
+    Submit,
+    Exit,
+    Continue,
+}
+
+fn render_interactive_ui(
+    entries: &[String],
+    editor: &mut Editor,
+    stdout: &mut impl Write,
+) -> Result<(), String> {
+    let (width, height) = terminal::size().map_err(|err| err.to_string())?;
+    let width = width.max(1) as usize;
+    let height = height.max(1) as usize;
+
+    let mut chat_lines = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        chat_lines.extend(wrap_text_with_ansi(entry, width));
+        if idx + 1 < entries.len() {
+            chat_lines.push(String::new());
+        }
+    }
+    if chat_lines.is_empty() {
+        chat_lines.push(String::new());
+    }
+
+    let editor_lines = editor.render(width);
+    let available_chat = height.saturating_sub(editor_lines.len());
+    let start = chat_lines.len().saturating_sub(available_chat);
+    let mut visible_chat = chat_lines[start..].to_vec();
+    while visible_chat.len() < available_chat {
+        visible_chat.push(String::new());
+    }
+
+    let mut lines = Vec::new();
+    lines.extend(visible_chat);
+    lines.extend(editor_lines);
+    if lines.len() > height {
+        lines.truncate(height);
+    }
+
+    stdout
+        .execute(MoveTo(0, 0))
+        .map_err(|err| err.to_string())?;
+    stdout
+        .execute(Clear(ClearType::All))
+        .map_err(|err| err.to_string())?;
+
+    for (index, line) in lines.iter().enumerate() {
+        let truncated = truncate_to_width(line, width);
+        if index + 1 == lines.len() {
+            write!(stdout, "{truncated}").map_err(|err| err.to_string())?;
+        } else {
+            writeln!(stdout, "{truncated}").map_err(|err| err.to_string())?;
+        }
+    }
+    stdout.flush().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn build_user_entry(message: Option<&str>, images: &[FileInputImage]) -> String {
+    let mut lines = Vec::new();
+    if let Some(message) = message {
+        if !message.trim().is_empty() {
+            lines.push(message.to_string());
+        }
+    }
+    for _ in images {
+        lines.push("[image attachment]".to_string());
+    }
+    if lines.is_empty() {
+        "[empty message]".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn last_assistant_text(session: &AgentSession) -> Result<String, String> {
+    let messages = session.messages();
+    let assistant = messages.iter().rev().find_map(|message| {
+        if let AgentMessage::Assistant(assistant) = message {
+            Some(assistant)
+        } else {
+            None
+        }
+    });
+
+    let assistant = assistant.ok_or_else(|| "No assistant response.".to_string())?;
+    if assistant.stop_reason == "error" || assistant.stop_reason == "aborted" {
+        return Err(assistant
+            .error_message
+            .clone()
+            .unwrap_or_else(|| format!("Request {}", assistant.stop_reason)));
+    }
+    let mut text = String::new();
+    for block in &assistant.content {
+        if let ContentBlock::Text { text: chunk, .. } = block {
+            text.push_str(chunk);
+        }
+    }
+    Ok(text)
+}
+
+fn prompt_and_append_text(
+    session: &mut AgentSession,
+    entries: &mut Vec<String>,
+    editor: &mut Editor,
+    stdout: &mut impl Write,
+    prompt: &str,
+) -> Result<(), String> {
+    entries.push(format!("You:\n{prompt}"));
+    entries.push("Assistant:\n...".to_string());
+    render_interactive_ui(entries, editor, stdout)?;
+
+    if let Err(err) = session.prompt(prompt) {
+        let last = entries.len().saturating_sub(1);
+        if let Some(entry) = entries.get_mut(last) {
+            *entry = format!("Assistant:\nError: {}", err);
+        }
+        render_interactive_ui(entries, editor, stdout)?;
+        return Err(err.to_string());
+    }
+
+    let response = last_assistant_text(session)?;
+    if let Some(entry) = entries.last_mut() {
+        *entry = format!("Assistant:\n{response}");
+    }
+    render_interactive_ui(entries, editor, stdout)?;
+    Ok(())
+}
+
+fn prompt_and_append_content(
+    session: &mut AgentSession,
+    entries: &mut Vec<String>,
+    editor: &mut Editor,
+    stdout: &mut impl Write,
+    prompt: &str,
+    content: UserContent,
+) -> Result<(), String> {
+    entries.push(format!("You:\n{prompt}"));
+    entries.push("Assistant:\n...".to_string());
+    render_interactive_ui(entries, editor, stdout)?;
+
+    if let Err(err) = session.prompt_content(content) {
+        let last = entries.len().saturating_sub(1);
+        if let Some(entry) = entries.get_mut(last) {
+            *entry = format!("Assistant:\nError: {}", err);
+        }
+        render_interactive_ui(entries, editor, stdout)?;
+        return Err(err.to_string());
+    }
+
+    let response = last_assistant_text(session)?;
+    if let Some(entry) = entries.last_mut() {
+        *entry = format!("Assistant:\n{response}");
+    }
+    render_interactive_ui(entries, editor, stdout)?;
+    Ok(())
+}
+
+fn handle_key_event(key: KeyEvent, editor: &mut Editor) -> EditorAction {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return EditorAction::Exit;
+        }
+        KeyCode::Enter => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+            {
+                editor.handle_input("\n");
+            } else {
+                return EditorAction::Submit;
+            }
+        }
+        KeyCode::Backspace => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                editor.handle_input("\x1b\x7f");
+            } else {
+                editor.handle_input("\x7f");
+            }
+        }
+        KeyCode::Up => {
+            editor.handle_input("\x1b[A");
+        }
+        KeyCode::Down => {
+            editor.handle_input("\x1b[B");
+        }
+        KeyCode::Left => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                editor.handle_input("\x1b[1;5D");
+            } else {
+                editor.handle_input("\x1b[D");
+            }
+        }
+        KeyCode::Right => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                editor.handle_input("\x1b[1;5C");
+            } else {
+                editor.handle_input("\x1b[C");
+            }
+        }
+        KeyCode::Tab => {
+            editor.handle_input("\t");
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            editor.handle_input("\x01");
+        }
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            editor.handle_input("\x17");
+        }
+        KeyCode::Char(ch) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                return EditorAction::Continue;
+            }
+            editor.handle_input(&ch.to_string());
+        }
+        _ => {}
+    }
+    EditorAction::Continue
+}
+
 fn run_interactive_mode_session(
     session: &mut AgentSession,
     messages: &[String],
     initial_message: Option<String>,
     initial_images: &[FileInputImage],
 ) -> Result<(), String> {
+    let mut entries = Vec::new();
+    let mut editor = Editor::new(EditorTheme {
+        border_color: |text| text.to_string(),
+    });
+
+    let mut stdout = io::stdout();
+    let _guard = TerminalGuard::enter(&mut stdout)?;
+
     if initial_message.is_some() || !initial_images.is_empty() {
+        let prompt = build_user_entry(initial_message.as_deref(), initial_images);
         let content = build_user_content_from_files(initial_message.as_deref(), initial_images)?;
-        session
-            .prompt_content(content)
-            .map_err(|err| err.to_string())?;
-        print_last_assistant_text(session)?;
+        prompt_and_append_content(
+            session,
+            &mut entries,
+            &mut editor,
+            &mut stdout,
+            &prompt,
+            content,
+        )?;
     }
 
     for message in messages {
         if message.trim().is_empty() {
             continue;
         }
-        session.prompt(message).map_err(|err| err.to_string())?;
-        print_last_assistant_text(session)?;
+        prompt_and_append_text(session, &mut entries, &mut editor, &mut stdout, message)?;
     }
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    render_interactive_ui(&entries, &mut editor, &mut stdout)?;
 
     loop {
-        write!(stdout, "> ").map_err(|err| err.to_string())?;
-        stdout.flush().map_err(|err| err.to_string())?;
-
-        let mut line = String::new();
-        let bytes = stdin.read_line(&mut line).map_err(|err| err.to_string())?;
-        if bytes == 0 {
-            break;
+        match event::read().map_err(|err| err.to_string())? {
+            Event::Key(key) => match handle_key_event(key, &mut editor) {
+                EditorAction::Exit => break,
+                EditorAction::Submit => {
+                    let text = editor.get_text();
+                    let prompt = text.trim_end().to_string();
+                    let trimmed = prompt.trim();
+                    editor.set_text("");
+                    if trimmed.is_empty() {
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
+                    if matches!(trimmed, "/exit" | "/quit") {
+                        break;
+                    }
+                    editor.add_to_history(&prompt);
+                    prompt_and_append_text(
+                        session,
+                        &mut entries,
+                        &mut editor,
+                        &mut stdout,
+                        &prompt,
+                    )?
+                }
+                EditorAction::Continue => {
+                    render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                }
+            },
+            Event::Resize(_, _) => {
+                render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+            }
+            _ => {}
         }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if matches!(trimmed, "/exit" | "/quit") {
-            break;
-        }
-
-        session.prompt(trimmed).map_err(|err| err.to_string())?;
-        print_last_assistant_text(session)?;
     }
 
     Ok(())

@@ -137,7 +137,7 @@ Planned modules (initial, not final):
 - Settings manager now loads `settings.json` (global + project override) for compaction/retry/theme defaults and persists global updates.
 - RPC prompt streamingBehavior now matches TS (only queues when streaming; images are ignored during queueing).
 - RPC mode now supports `openai-responses` models alongside `anthropic-messages`.
-- Interactive mode now supports a basic line-based REPL (full TUI pending).
+- Interactive mode now uses a basic TUI (chat history + editor) over raw terminal input (full parity pending).
 - CLI `--resume` now lists available sessions and prompts for a selection in the line-based UI.
 - CLI now parses `--extension`/`-e` and persists extension paths to settings (extension execution pending).
 
