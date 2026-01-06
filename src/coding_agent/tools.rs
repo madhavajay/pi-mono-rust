@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const DEFAULT_MAX_LINES: usize = 2000;
 const DEFAULT_MAX_BYTES: usize = 50 * 1024;
@@ -349,10 +350,18 @@ impl BashTool {
     }
 
     pub fn execute(&self, _call_id: &str, args: BashToolArgs) -> Result<ToolResult, String> {
+        let cwd = self.cwd.clone();
+        if !cwd.exists() {
+            return Err(format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                cwd.display()
+            ));
+        }
+
         let mut child = Command::new("bash")
             .arg("-lc")
             .arg(&args.command)
-            .current_dir(&self.cwd)
+            .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -392,34 +401,87 @@ impl BashTool {
             let _ = err.read_to_end(&mut output);
         }
         let combined = String::from_utf8_lossy(&output).to_string();
+        let truncation = truncate_tail(&combined, None);
+        let mut output_text = if truncation.content.is_empty() {
+            "(no output)".to_string()
+        } else {
+            truncation.content.clone()
+        };
+
+        let mut details = None;
+        if truncation.truncated {
+            let (full_output_path, path_label) = match write_bash_output_temp(&combined) {
+                Ok(path) => {
+                    let display = path.to_string_lossy().to_string();
+                    (Some(path), Some(display))
+                }
+                Err(_) => (None, None),
+            };
+
+            let start_line = truncation
+                .total_lines
+                .saturating_sub(truncation.output_lines)
+                .saturating_add(1);
+            let end_line = truncation.total_lines;
+            let mut notice = if truncation.last_line_partial {
+                let last_line = combined.split('\n').next_back().unwrap_or("");
+                let last_line_size = format_size(last_line.len());
+                format!(
+                    "Showing last {} of line {} (line is {})",
+                    format_size(truncation.output_bytes),
+                    end_line,
+                    last_line_size
+                )
+            } else if matches!(truncation.truncated_by, Some(TruncatedBy::Lines)) {
+                format!(
+                    "Showing lines {}-{} of {}",
+                    start_line, end_line, truncation.total_lines
+                )
+            } else {
+                format!(
+                    "Showing lines {}-{} of {} ({} limit)",
+                    start_line,
+                    end_line,
+                    truncation.total_lines,
+                    format_size(DEFAULT_MAX_BYTES)
+                )
+            };
+
+            if let Some(path) = &path_label {
+                notice.push_str(&format!(". Full output: {path}"));
+            }
+
+            output_text.push_str(&format!("\n\n[{notice}]"));
+            details = Some(json!({
+                "truncation": truncation,
+                "fullOutputPath": path_label,
+            }));
+            let _ = full_output_path;
+        }
 
         if timed_out {
-            return Err(format!(
-                "{}Command timed out after {} seconds",
-                if combined.is_empty() { "" } else { "\n\n" },
+            output_text.push_str(&format!(
+                "\n\nCommand timed out after {} seconds",
                 args.timeout.unwrap_or(0)
             ));
+            return Err(output_text);
         }
 
         let status = exit_status.ok_or_else(|| "Command did not exit".to_string())?;
         if !status.success() {
-            return Err(format!(
-                "{}Command failed with code {}",
-                if combined.is_empty() { "" } else { "\n\n" },
+            output_text.push_str(&format!(
+                "\n\nCommand exited with code {}",
                 status.code().unwrap_or(-1)
             ));
+            return Err(output_text);
         }
 
         Ok(ToolResult {
             content: vec![ContentBlock::Text {
-                text: if combined.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    combined
-                },
+                text: output_text,
                 text_signature: None,
             }],
-            details: None,
+            details,
         })
     }
 }
@@ -865,12 +927,107 @@ fn truncate_head(content: &str, options: Option<(usize, usize)>) -> TruncationRe
     }
 }
 
+fn truncate_tail(content: &str, options: Option<(usize, usize)>) -> TruncationResult {
+    let (max_lines, max_bytes) = options.unwrap_or((DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES));
+    let total_bytes = content.len();
+    let lines: Vec<&str> = content.split('\n').collect();
+    let total_lines = lines.len();
+
+    if total_lines <= max_lines && total_bytes <= max_bytes {
+        return TruncationResult {
+            content: content.to_string(),
+            truncated: false,
+            truncated_by: None,
+            total_lines,
+            total_bytes,
+            output_lines: total_lines,
+            output_bytes: total_bytes,
+            last_line_partial: false,
+            first_line_exceeds_limit: false,
+            max_lines,
+            max_bytes,
+        };
+    }
+
+    let mut output_lines = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut truncated_by = TruncatedBy::Lines;
+    let mut last_line_partial = false;
+
+    for idx in (0..lines.len()).rev() {
+        if output_lines.len() >= max_lines {
+            break;
+        }
+        let line = lines[idx];
+        let line_bytes = line.len() + if output_lines.is_empty() { 0 } else { 1 };
+        if output_bytes + line_bytes > max_bytes {
+            truncated_by = TruncatedBy::Bytes;
+            if output_lines.is_empty() {
+                let truncated_line = truncate_string_to_bytes_from_end(line, max_bytes);
+                output_bytes = truncated_line.len();
+                output_lines.insert(0, truncated_line);
+                last_line_partial = true;
+            }
+            break;
+        }
+
+        output_lines.insert(0, line.to_string());
+        output_bytes += line_bytes;
+    }
+
+    if output_lines.len() >= max_lines && output_bytes <= max_bytes {
+        truncated_by = TruncatedBy::Lines;
+    }
+
+    let output_content = output_lines.join("\n");
+    let final_output_bytes = output_content.len();
+
+    TruncationResult {
+        content: output_content,
+        truncated: true,
+        truncated_by: Some(truncated_by),
+        total_lines,
+        total_bytes,
+        output_lines: output_lines.len(),
+        output_bytes: final_output_bytes,
+        last_line_partial,
+        first_line_exceeds_limit: false,
+        max_lines,
+        max_bytes,
+    }
+}
+
 fn truncate_line(line: &str, max_chars: usize) -> (String, bool) {
     if line.len() <= max_chars {
         (line.to_string(), false)
     } else {
         (format!("{}... [truncated]", &line[..max_chars]), true)
     }
+}
+
+fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
+    let bytes = line.as_bytes();
+    if bytes.len() <= max_bytes {
+        return line.to_string();
+    }
+    let mut start = bytes.len().saturating_sub(max_bytes);
+    while start < bytes.len() && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    if start >= bytes.len() {
+        return String::new();
+    }
+    std::str::from_utf8(&bytes[start..])
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn write_bash_output_temp(output: &str) -> Result<PathBuf, String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("pi-bash-{}.log", Uuid::new_v4()));
+    fs::write(&path, output.as_bytes())
+        .map_err(|err| format!("Failed to write bash output: {err}"))?;
+    Ok(path)
 }
 
 enum GrepMatcher {

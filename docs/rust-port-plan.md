@@ -128,6 +128,7 @@ Planned modules (initial, not final):
 - Grep now supports directory search with regex/literal matching plus truncation notices for grep/find/ls output.
 - Print mode now uses `AgentSession` with session persistence (`--continue`, `--session`, `--session-dir`, `--no-session`).
 - Session default directory respects `PI_CODING_AGENT_DIR` for `sessions/`.
+- Bash tool now truncates tail output with temp file preservation when output exceeds limits.
 
 ## Test Plan
 ### Baseline (TS)
