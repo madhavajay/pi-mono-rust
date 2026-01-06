@@ -58,7 +58,7 @@ Options:
   @file            Include file contents in prompt (text or images)
 
 Notes:
-  Interactive mode is not implemented yet.
+  Interactive mode is line-based (full TUI pending).
   --resume, --hook, --tool are not implemented yet."
     );
 }
@@ -911,29 +911,85 @@ fn run_print_mode_session(
     }
 
     if matches!(mode, Mode::Text) {
-        let messages = session.messages();
-        let assistant = messages.iter().rev().find_map(|message| {
-            if let AgentMessage::Assistant(assistant) = message {
-                Some(assistant)
-            } else {
-                None
-            }
-        });
-
-        let assistant = assistant.ok_or_else(|| "No assistant response.".to_string())?;
-        if assistant.stop_reason == "error" || assistant.stop_reason == "aborted" {
-            return Err(assistant
-                .error_message
-                .clone()
-                .unwrap_or_else(|| format!("Request {}", assistant.stop_reason)));
-        }
-        for block in &assistant.content {
-            if let ContentBlock::Text { text, .. } = block {
-                println!("{text}");
-            }
-        }
+        print_last_assistant_text(session)?;
     }
 
+    Ok(())
+}
+
+fn run_interactive_mode_session(
+    session: &mut AgentSession,
+    messages: &[String],
+    initial_message: Option<String>,
+    initial_images: &[FileInputImage],
+) -> Result<(), String> {
+    if initial_message.is_some() || !initial_images.is_empty() {
+        let content = build_user_content_from_files(initial_message.as_deref(), initial_images)?;
+        session
+            .prompt_content(content)
+            .map_err(|err| err.to_string())?;
+        print_last_assistant_text(session)?;
+    }
+
+    for message in messages {
+        if message.trim().is_empty() {
+            continue;
+        }
+        session.prompt(message).map_err(|err| err.to_string())?;
+        print_last_assistant_text(session)?;
+    }
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    loop {
+        write!(stdout, "> ").map_err(|err| err.to_string())?;
+        stdout.flush().map_err(|err| err.to_string())?;
+
+        let mut line = String::new();
+        let bytes = stdin.read_line(&mut line).map_err(|err| err.to_string())?;
+        if bytes == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if matches!(trimmed, "/exit" | "/quit") {
+            break;
+        }
+
+        session.prompt(trimmed).map_err(|err| err.to_string())?;
+        print_last_assistant_text(session)?;
+    }
+
+    Ok(())
+}
+
+fn print_last_assistant_text(session: &AgentSession) -> Result<(), String> {
+    let messages = session.messages();
+    let assistant = messages.iter().rev().find_map(|message| {
+        if let AgentMessage::Assistant(assistant) = message {
+            Some(assistant)
+        } else {
+            None
+        }
+    });
+
+    let assistant = assistant.ok_or_else(|| "No assistant response.".to_string())?;
+    if assistant.stop_reason == "error" || assistant.stop_reason == "aborted" {
+        return Err(assistant
+            .error_message
+            .clone()
+            .unwrap_or_else(|| format!("Request {}", assistant.stop_reason)));
+    }
+    for block in &assistant.content {
+        if let ContentBlock::Text { text, .. } = block {
+            println!("{text}");
+        }
+    }
     Ok(())
 }
 
@@ -1264,10 +1320,6 @@ fn main() {
     }
 
     let is_interactive = !parsed.print && parsed.mode.is_none();
-    if is_interactive {
-        eprintln!("Error: interactive mode is not implemented yet. Use --print or --mode.");
-        process::exit(1);
-    }
 
     let mode = parsed.mode.clone().unwrap_or(Mode::Text);
 
@@ -1407,13 +1459,19 @@ fn main() {
     };
     apply_cli_thinking_level(&parsed, &mut session);
 
-    if let Err(message) = run_print_mode_session(
-        mode,
-        &mut session,
-        &messages,
-        initial_message,
-        &initial_images,
-    ) {
+    let result = if is_interactive {
+        run_interactive_mode_session(&mut session, &messages, initial_message, &initial_images)
+    } else {
+        run_print_mode_session(
+            mode,
+            &mut session,
+            &messages,
+            initial_message,
+            &initial_images,
+        )
+    };
+
+    if let Err(message) = result {
         eprintln!("Error: {message}");
         process::exit(1);
     }
