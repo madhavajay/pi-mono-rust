@@ -1,4 +1,6 @@
 pub mod export_html;
+pub mod extension_host;
+pub mod extensions;
 pub mod fuzzy;
 pub mod tools;
 
@@ -22,6 +24,8 @@ pub use agent_session::{
 };
 pub use auth_storage::{AuthCredential, AuthStorage};
 pub use export_html::{export_from_file, export_session_to_html};
+pub use extension_host::{ExtensionHost, ExtensionManifest};
+pub use extensions::discover_extension_paths;
 pub use hooks::{
     CompactionHook, CompactionResult, HookAPI, HookContext, SessionBeforeCompactEvent,
     SessionBeforeCompactResult, SessionCompactEvent,

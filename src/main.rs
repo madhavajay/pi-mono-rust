@@ -2,14 +2,16 @@ use pi::agent::{
     Agent, AgentMessage, AgentOptions, AgentStateOverride, AgentTool, AgentToolResult, LlmContext,
     Model as AgentModel, QueueMode, ThinkingLevel,
 };
-use pi::cli::args::ThinkingLevel as CliThinkingLevel;
+use pi::cli::args::{ExtensionFlagType, ExtensionFlagValue, ThinkingLevel as CliThinkingLevel};
 use pi::cli::list_models::list_models;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
     build_system_prompt, export_from_file, load_prompt_templates, AgentSession, AgentSessionConfig,
-    AuthCredential, AuthStorage, BuildSystemPromptOptions, LoadPromptTemplatesOptions,
-    Model as RegistryModel, ModelRegistry, SettingsManager,
+    AuthCredential, AuthStorage, BuildSystemPromptOptions, ExtensionHost,
+    LoadPromptTemplatesOptions, Model as RegistryModel, ModelRegistry, SettingsManager,
 };
+use pi::coding_agent::{discover_extension_paths, ExtensionManifest};
+use pi::config;
 use pi::core::messages::{
     AgentMessage as CoreAgentMessage, AssistantMessage, ContentBlock, Cost, ToolResultMessage,
     Usage, UserContent,
@@ -36,7 +38,6 @@ use crossterm::ExecutableCommand;
 
 const DEFAULT_OAUTH_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
-const CONFIG_DIR_NAME: &str = ".pi";
 
 fn print_help() {
     println!(
@@ -67,8 +68,39 @@ Options:
 
 Notes:
   Interactive mode uses a basic TUI (full parity pending).
-  Extension execution is not implemented yet in the Rust port."
+  Extensions can register additional CLI flags.
+  Extension execution (compaction hooks) is supported for .js files only."
     );
+}
+
+fn collect_extension_flags(manifest: &ExtensionManifest) -> HashMap<String, ExtensionFlagType> {
+    let mut flags = HashMap::new();
+    for extension in &manifest.extensions {
+        for flag in &extension.flags {
+            let flag_type = match flag.flag_type.as_deref() {
+                Some("boolean") => ExtensionFlagType::Bool,
+                Some("string") => ExtensionFlagType::String,
+                _ => continue,
+            };
+            flags.insert(flag.name.clone(), flag_type);
+        }
+    }
+    flags
+}
+
+fn extension_flag_values_to_json(
+    values: &HashMap<String, ExtensionFlagValue>,
+) -> HashMap<String, Value> {
+    values
+        .iter()
+        .map(|(name, value)| {
+            let json_value = match value {
+                ExtensionFlagValue::Bool(flag) => Value::Bool(*flag),
+                ExtensionFlagValue::String(text) => Value::String(text.clone()),
+            };
+            (name.clone(), json_value)
+        })
+        .collect()
 }
 
 fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
@@ -539,25 +571,6 @@ fn build_openai_headers(
     Ok(headers)
 }
 
-fn get_agent_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("PI_CODING_AGENT_DIR") {
-        if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir));
-        }
-    }
-
-    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()?;
-    Some(PathBuf::from(home).join(".pi").join("agent"))
-}
-
-fn get_auth_path() -> Option<PathBuf> {
-    get_agent_dir().map(|dir| dir.join("auth.json"))
-}
-
-fn get_models_path() -> Option<PathBuf> {
-    get_agent_dir().map(|dir| dir.join("models.json"))
-}
-
 fn env_var_non_empty(key: &str) -> Option<String> {
     env::var(key).ok().and_then(|value| {
         if value.trim().is_empty() {
@@ -594,19 +607,21 @@ fn build_model_registry(
     api_key_override: Option<&str>,
     provider: Option<&str>,
 ) -> Result<ModelRegistry, String> {
-    let auth_path =
-        get_auth_path().ok_or_else(|| "Unable to resolve auth.json path.".to_string())?;
+    let auth_path = config::get_auth_path();
     let mut auth_storage = AuthStorage::new(auth_path);
     apply_env_api_keys_for_availability(&mut auth_storage);
     if let Some(api_key) = api_key_override {
         let provider = provider.unwrap_or("anthropic");
         auth_storage.set_runtime_api_key(provider, api_key);
     }
-    Ok(ModelRegistry::new(auth_storage, get_models_path()))
+    Ok(ModelRegistry::new(
+        auth_storage,
+        Some(config::get_models_path()),
+    ))
 }
 
 fn read_auth_credential(provider: &str) -> Option<AuthCredential> {
-    let path = get_auth_path()?;
+    let path = config::get_auth_path();
     let content = std::fs::read_to_string(path).ok()?;
     let data: AuthStorageData = serde_json::from_str(&content).ok()?;
     data.get(provider).cloned()
@@ -659,12 +674,12 @@ fn resolve_openai_credentials(api_key_override: Option<&str>) -> Result<String, 
 
 fn discover_system_prompt_file() -> Option<PathBuf> {
     let cwd = env::current_dir().ok()?;
-    let project_path = cwd.join(CONFIG_DIR_NAME).join("SYSTEM.md");
+    let project_path = cwd.join(config::config_dir_name()).join("SYSTEM.md");
     if project_path.exists() {
         return Some(project_path);
     }
 
-    let global_path = get_agent_dir()?.join("SYSTEM.md");
+    let global_path = config::get_agent_dir().join("SYSTEM.md");
     if global_path.exists() {
         return Some(global_path);
     }
@@ -1609,9 +1624,94 @@ fn apply_cli_thinking_level(parsed: &Args, session: &mut AgentSession) {
     }
 }
 
+fn attach_extensions(session: &mut AgentSession, cwd: &Path) {
+    let agent_dir = config::get_agent_dir();
+    let configured = session.settings_manager.get_extension_paths();
+    let discovered = discover_extension_paths(&configured, cwd, &agent_dir);
+    if discovered.is_empty() {
+        return;
+    }
+    match ExtensionHost::spawn(&discovered, cwd) {
+        Ok((host, manifest)) => {
+            report_extension_manifest(&manifest);
+            session.set_extension_host(host);
+        }
+        Err(err) => {
+            eprintln!("Warning: Failed to load extensions: {err}");
+        }
+    }
+}
+
+fn attach_extensions_with_host(
+    session: &mut AgentSession,
+    cwd: &Path,
+    preloaded: Option<(ExtensionHost, ExtensionManifest)>,
+) {
+    if let Some((host, manifest)) = preloaded {
+        report_extension_manifest(&manifest);
+        session.set_extension_host(host);
+        return;
+    }
+    attach_extensions(session, cwd);
+}
+
+fn report_extension_manifest(manifest: &ExtensionManifest) {
+    if !manifest.skipped_paths.is_empty() {
+        let skipped = manifest
+            .skipped_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("Warning: Skipping unsupported extensions (JS only): {skipped}");
+    }
+    for error in &manifest.errors {
+        eprintln!(
+            "Warning: Extension {} failed to load: {}",
+            error.extension_path, error.error
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let parsed = parse_args(&args);
+    let first_pass = parse_args(&args, None);
+
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            eprintln!("Error: Failed to read cwd: {err}");
+            process::exit(1);
+        }
+    };
+
+    let settings_manager = SettingsManager::create("", "");
+    let mut extension_paths = settings_manager.get_extension_paths();
+    if let Some(paths) = first_pass.extensions.as_deref() {
+        extension_paths.extend(paths.iter().cloned());
+    }
+    let discovered = discover_extension_paths(&extension_paths, &cwd, &config::get_agent_dir());
+    let mut preloaded_extension: Option<(ExtensionHost, ExtensionManifest)> = None;
+    let mut extension_flag_types = HashMap::new();
+    if !discovered.is_empty() {
+        match ExtensionHost::spawn(&discovered, &cwd) {
+            Ok((host, manifest)) => {
+                extension_flag_types = collect_extension_flags(&manifest);
+                preloaded_extension = Some((host, manifest));
+            }
+            Err(err) => {
+                eprintln!("Warning: Failed to load extensions: {err}");
+            }
+        }
+    }
+
+    let parsed = parse_args(&args, Some(&extension_flag_types));
+    if let Some((host, _)) = preloaded_extension.as_mut() {
+        let flag_values = extension_flag_values_to_json(&parsed.extension_flags);
+        if let Err(err) = host.set_flag_values(&flag_values) {
+            eprintln!("Warning: Failed to apply extension flags: {err}");
+        }
+    }
 
     if parsed.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
@@ -1661,16 +1761,6 @@ fn main() {
         );
         process::exit(1);
     }
-    if parsed
-        .extensions
-        .as_ref()
-        .is_some_and(|paths| !paths.is_empty())
-    {
-        eprintln!(
-            "Warning: extensions are configured, but extension execution is not implemented yet."
-        );
-    }
-
     let is_interactive = !parsed.print && parsed.mode.is_none();
 
     let mode = parsed.mode.clone().unwrap_or(Mode::Text);
@@ -1707,13 +1797,6 @@ fn main() {
         process::exit(1);
     }
 
-    let cwd = match env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(err) => {
-            eprintln!("Error: Failed to read cwd: {err}");
-            process::exit(1);
-        }
-    };
     let system_prompt_source = if parsed.system_prompt.is_some() {
         parsed.system_prompt.clone()
     } else {
@@ -1733,7 +1816,7 @@ fn main() {
         skills_enabled: !parsed.no_skills,
         skills_include: skill_patterns,
         cwd: Some(cwd.clone()),
-        agent_dir: get_agent_dir(),
+        agent_dir: Some(config::get_agent_dir()),
         ..Default::default()
     });
     let session_manager = if parsed.resume {
@@ -1779,6 +1862,7 @@ fn main() {
             session.settings_manager.set_extension_paths(paths.to_vec());
         }
         apply_cli_thinking_level(&parsed, &mut session);
+        attach_extensions_with_host(&mut session, &cwd, preloaded_extension.take());
         if let Err(message) = run_rpc_mode(session) {
             eprintln!("Error: {message}");
             process::exit(1);
@@ -1829,6 +1913,7 @@ fn main() {
         session.settings_manager.set_extension_paths(paths.to_vec());
     }
     apply_cli_thinking_level(&parsed, &mut session);
+    attach_extensions_with_host(&mut session, &cwd, preloaded_extension.take());
 
     let result = if is_interactive {
         run_interactive_mode_session(&mut session, &messages, initial_message, &initial_images)
@@ -3128,7 +3213,7 @@ fn create_cli_session(
     });
     let templates = load_prompt_templates(LoadPromptTemplatesOptions {
         cwd: Some(cwd),
-        agent_dir: get_agent_dir(),
+        agent_dir: Some(config::get_agent_dir()),
     });
     session.set_prompt_templates(templates);
     Ok(session)
@@ -3203,7 +3288,7 @@ fn create_rpc_session(
     });
     let templates = load_prompt_templates(LoadPromptTemplatesOptions {
         cwd: Some(cwd),
-        agent_dir: get_agent_dir(),
+        agent_dir: Some(config::get_agent_dir()),
     });
     session.set_prompt_templates(templates);
     Ok(session)

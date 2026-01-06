@@ -1,3 +1,4 @@
+use crate::config;
 use glob::Pattern;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -14,7 +15,6 @@ const ALLOWED_FRONTMATTER_FIELDS: [&str; 6] = [
 ];
 const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
-const CONFIG_DIR_NAME: &str = ".pi";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
@@ -131,9 +131,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
     let cwd = options
         .cwd
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let agent_dir = options
-        .agent_dir
-        .unwrap_or_else(|| home_dir().join(CONFIG_DIR_NAME).join("agent"));
+    let agent_dir = options.agent_dir.unwrap_or_else(config::get_agent_dir);
 
     let mut skill_map: HashMap<String, Skill> = HashMap::new();
     let mut real_paths: HashSet<String> = HashSet::new();
@@ -225,7 +223,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
 
     if options.enable_pi_project {
         add_skills(load_skills_from_dir_internal(
-            &cwd.join(CONFIG_DIR_NAME).join("skills"),
+            &cwd.join(config::config_dir_name()).join("skills"),
             "project",
             SkillFormat::Recursive,
         ));

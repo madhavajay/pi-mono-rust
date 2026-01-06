@@ -1,11 +1,12 @@
-use pi::{parse_args, Args, Mode, ThinkingLevel};
+use pi::{parse_args, Args, ExtensionFlagType, ExtensionFlagValue, Mode, ThinkingLevel};
+use std::collections::HashMap;
 
 fn parse(input: &[&str]) -> Args {
     let args = input
         .iter()
         .map(|value| value.to_string())
         .collect::<Vec<_>>();
-    parse_args(&args)
+    parse_args(&args, None)
 }
 
 #[test]
@@ -151,6 +152,31 @@ fn parses_messages_and_file_args() {
 
     let result = parse(&["--unknown-flag", "message"]);
     assert_eq!(result.messages, vec!["message".to_string()]);
+}
+
+#[test]
+fn parses_extension_defined_flags() {
+    let mut extension_flags = HashMap::new();
+    extension_flags.insert("plan".to_string(), ExtensionFlagType::Bool);
+    extension_flags.insert("profile".to_string(), ExtensionFlagType::String);
+
+    let args = vec![
+        "--plan".to_string(),
+        "--profile".to_string(),
+        "fast".to_string(),
+        "message".to_string(),
+    ];
+    let parsed = parse_args(&args, Some(&extension_flags));
+
+    assert_eq!(
+        parsed.extension_flags.get("plan"),
+        Some(&ExtensionFlagValue::Bool(true))
+    );
+    assert_eq!(
+        parsed.extension_flags.get("profile"),
+        Some(&ExtensionFlagValue::String("fast".to_string()))
+    );
+    assert_eq!(parsed.messages, vec!["message".to_string()]);
 }
 
 #[test]

@@ -46,6 +46,18 @@ pub enum ListModels {
     Pattern(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionFlagType {
+    Bool,
+    String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionFlagValue {
+    Bool(bool),
+    String(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Args {
     pub provider: Option<String>,
@@ -72,6 +84,7 @@ pub struct Args {
     pub list_models: Option<ListModels>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
+    pub extension_flags: std::collections::HashMap<String, ExtensionFlagValue>,
 }
 
 const VALID_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -80,7 +93,10 @@ pub fn is_valid_thinking_level(level: &str) -> bool {
     ThinkingLevel::parse(level).is_some()
 }
 
-pub fn parse_args(args: &[String]) -> Args {
+pub fn parse_args(
+    args: &[String],
+    extension_flags: Option<&std::collections::HashMap<String, ExtensionFlagType>>,
+) -> Args {
     let mut result = Args {
         provider: None,
         model: None,
@@ -106,6 +122,7 @@ pub fn parse_args(args: &[String]) -> Args {
         list_models: None,
         messages: Vec::new(),
         file_args: Vec::new(),
+        extension_flags: std::collections::HashMap::new(),
     };
 
     let mut i = 0;
@@ -240,6 +257,29 @@ pub fn parse_args(args: &[String]) -> Args {
                 result
                     .file_args
                     .push(arg.trim_start_matches('@').to_string());
+            }
+            _ if arg.starts_with("--") => {
+                if let Some(flags) = extension_flags {
+                    let flag_name = arg.trim_start_matches("--");
+                    if let Some(flag_type) = flags.get(flag_name) {
+                        match flag_type {
+                            ExtensionFlagType::Bool => {
+                                result
+                                    .extension_flags
+                                    .insert(flag_name.to_string(), ExtensionFlagValue::Bool(true));
+                            }
+                            ExtensionFlagType::String => {
+                                if i + 1 < args.len() {
+                                    result.extension_flags.insert(
+                                        flag_name.to_string(),
+                                        ExtensionFlagValue::String(args[i + 1].clone()),
+                                    );
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             _ if !arg.starts_with('-') => {
                 result.messages.push(arg.to_string());

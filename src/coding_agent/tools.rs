@@ -811,6 +811,15 @@ fn detect_image_mime_type(data: &[u8]) -> Option<&'static str> {
     if data.len() >= png_magic.len() && data[..png_magic.len()] == png_magic {
         return Some("image/png");
     }
+    if data.len() >= 3 && data[0..3] == [0xFF, 0xD8, 0xFF] {
+        return Some("image/jpeg");
+    }
+    if data.len() >= 6 && (&data[0..6] == b"GIF87a" || &data[0..6] == b"GIF89a") {
+        return Some("image/gif");
+    }
+    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
     None
 }
 

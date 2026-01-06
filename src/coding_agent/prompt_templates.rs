@@ -1,10 +1,9 @@
 use crate::coding_agent::slash_commands::{parse_command_args, substitute_args};
+use crate::config;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const CONFIG_DIR_NAME: &str = ".pi";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PromptTemplate {
@@ -31,7 +30,7 @@ pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptT
         .cwd
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let agent_dir = options.agent_dir.or_else(resolve_agent_dir);
+    let agent_dir = options.agent_dir.or_else(|| Some(config::get_agent_dir()));
     let mut templates = Vec::new();
 
     if let Some(agent_dir) = agent_dir {
@@ -43,7 +42,7 @@ pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptT
         ));
     }
 
-    let project_dir = cwd.join(CONFIG_DIR_NAME).join("prompts");
+    let project_dir = cwd.join(config::config_dir_name()).join("prompts");
     templates.extend(load_templates_from_dir(
         &project_dir,
         TemplateSource::Project,
@@ -225,15 +224,4 @@ fn truncate_to_length(value: &str, max_len: usize) -> String {
     }
 
     truncated
-}
-
-fn resolve_agent_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("PI_CODING_AGENT_DIR") {
-        if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir));
-        }
-    }
-
-    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()?;
-    Some(PathBuf::from(home).join(".pi").join("agent"))
 }

@@ -328,6 +328,72 @@ fn should_detect_image_mime_type_from_file_magic_not_extension() {
 }
 
 #[test]
+fn should_detect_additional_image_mime_types() {
+    let temp = TempDir::new("coding-agent-test");
+
+    let jpeg_file = temp.join("image.jpeg");
+    let jpeg_bytes: [u8; 11] = [
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
+    ];
+    fs::write(&jpeg_file, jpeg_bytes).expect("write jpeg");
+
+    let gif_file = temp.join("image.gif");
+    let gif_bytes: [u8; 6] = *b"GIF89a";
+    fs::write(&gif_file, gif_bytes).expect("write gif");
+
+    let webp_file = temp.join("image.webp");
+    let webp_bytes: [u8; 12] = *b"RIFF\x00\x00\x00\x00WEBP";
+    fs::write(&webp_file, webp_bytes).expect("write webp");
+
+    let tool = ReadTool::new(&temp.path);
+
+    let jpeg_result = tool
+        .execute(
+            "test-call-img-3",
+            ReadToolArgs {
+                path: jpeg_file.to_string_lossy().to_string(),
+                offset: None,
+                limit: None,
+            },
+        )
+        .expect("read jpeg");
+    assert!(get_text_output(&jpeg_result).contains("Read image file [image/jpeg]"));
+    assert!(jpeg_result.content.iter().any(
+        |block| matches!(block, ContentBlock::Image { mime_type, .. } if mime_type == "image/jpeg")
+    ));
+
+    let gif_result = tool
+        .execute(
+            "test-call-img-4",
+            ReadToolArgs {
+                path: gif_file.to_string_lossy().to_string(),
+                offset: None,
+                limit: None,
+            },
+        )
+        .expect("read gif");
+    assert!(get_text_output(&gif_result).contains("Read image file [image/gif]"));
+    assert!(gif_result.content.iter().any(
+        |block| matches!(block, ContentBlock::Image { mime_type, .. } if mime_type == "image/gif")
+    ));
+
+    let webp_result = tool
+        .execute(
+            "test-call-img-5",
+            ReadToolArgs {
+                path: webp_file.to_string_lossy().to_string(),
+                offset: None,
+                limit: None,
+            },
+        )
+        .expect("read webp");
+    assert!(get_text_output(&webp_result).contains("Read image file [image/webp]"));
+    assert!(webp_result.content.iter().any(
+        |block| matches!(block, ContentBlock::Image { mime_type, .. } if mime_type == "image/webp")
+    ));
+}
+
+#[test]
 fn should_treat_files_with_image_extension_but_non_image_content_as_text() {
     let temp = TempDir::new("coding-agent-test");
     let test_file = temp.join("not-an-image.png");

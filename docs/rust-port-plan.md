@@ -130,8 +130,10 @@ Planned modules (initial, not final):
 - Print mode now uses `AgentSession` with session persistence (`--continue`, `--session`, `--session-dir`, `--no-session`).
 - Session default directory respects `PI_CODING_AGENT_DIR` for `sessions/`.
 - Bash tool now truncates tail output with temp file preservation when output exceeds limits.
+- Read tool now detects PNG/JPEG/GIF/WebP via file signatures.
 - System prompt builder now mirrors TS defaults (tools/guidelines, project context files, skills; `--skills`/`--no-skills`).
 - Prompt templates from `~/.pi/agent/prompts` and `.pi/prompts` are loaded and expanded for `/command` inputs.
+- App config now reads `piConfig` from `package.json` when available (app name/config dir + env var), and project paths respect the configured dir name.
 - HTML export now uses the TS template assets with the default dark theme and supports CLI `--export` + RPC `export_html`.
 - CLI `--thinking` sets the initial thinking level and persists it to the session.
 - Settings manager now loads `settings.json` (global + project override) for compaction/retry/theme defaults and persists global updates.
@@ -139,7 +141,9 @@ Planned modules (initial, not final):
 - RPC mode now supports `openai-responses` models alongside `anthropic-messages`.
 - Interactive mode now uses a basic TUI (chat history + editor) over raw terminal input (full parity pending).
 - CLI `--resume` now lists available sessions and prompts for a selection in the line-based UI.
-- CLI now parses `--extension`/`-e` and persists extension paths to settings (extension execution pending).
+- CLI now parses `--extension`/`-e` and persists extension paths to settings; JS extensions can now run compaction hooks via the Node host (TS support pending).
+- Extension discovery now scans global/project directories plus configured paths and hands JS/TS extensions to the host (TS uses `jiti` when available).
+- CLI now parses extension-defined flags and passes flag values into the JS extension host (`getFlag` supported).
 
 ## Test Plan
 ### Baseline (TS)

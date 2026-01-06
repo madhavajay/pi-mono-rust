@@ -1,10 +1,12 @@
 use crate::agent::{Agent, AgentError, AgentEvent, AgentMessage, CustomMessage, ThinkingLevel};
 use crate::coding_agent::export_html::export_session_to_html;
+use crate::coding_agent::extension_host::ExtensionHost;
 use crate::coding_agent::hooks::{
     CompactionHook, CompactionResult, SessionBeforeCompactEvent, SessionCompactEvent,
 };
 use crate::coding_agent::prompt_templates::{expand_prompt_template, PromptTemplate};
 use crate::coding_agent::ModelRegistry;
+use crate::config;
 use crate::core::compaction::prepare_compaction;
 use crate::core::messages::{
     AgentMessage as CoreAgentMessage, BashExecutionMessage, ContentBlock, UserContent, UserMessage,
@@ -44,6 +46,7 @@ pub struct AgentSession {
     prompt_templates: Vec<PromptTemplate>,
     branch_summary_aborted: Cell<bool>,
     compaction_hooks: Vec<CompactionHook>,
+    extension_host: Option<Rc<RefCell<ExtensionHost>>>,
     listeners: Rc<RefCell<Vec<(usize, AgentSessionEventListener)>>>,
     next_listener_id: Rc<RefCell<usize>>,
     unsubscribe_agent: Option<Box<dyn FnOnce()>>,
@@ -99,6 +102,7 @@ impl AgentSession {
             prompt_templates: Vec::new(),
             branch_summary_aborted: Cell::new(false),
             compaction_hooks: Vec::new(),
+            extension_host: None,
             listeners,
             next_listener_id,
             unsubscribe_agent: Some(Box::new(unsubscribe)),
@@ -273,6 +277,25 @@ impl AgentSession {
 
     pub fn set_compaction_hooks(&mut self, hooks: Vec<CompactionHook>) {
         self.compaction_hooks = hooks;
+    }
+
+    pub fn set_extension_host(&mut self, host: ExtensionHost) {
+        let host = Rc::new(RefCell::new(host));
+        let before_host = host.clone();
+        let after_host = host.clone();
+        let hook = CompactionHook::new(
+            Some(Box::new(move |event| {
+                before_host
+                    .borrow_mut()
+                    .emit_before_compact(event)
+                    .unwrap_or_default()
+            })),
+            Some(Box::new(move |event| {
+                let _ = after_host.borrow_mut().emit_compact(event);
+            })),
+        );
+        self.compaction_hooks.push(hook);
+        self.extension_host = Some(host);
     }
 
     pub fn abort_branch_summary(&self) {
@@ -1096,7 +1119,7 @@ impl SettingsManager {
         let settings_path = agent_dir.as_ref().map(|dir| dir.join("settings.json"));
         let project_settings_path = cwd
             .as_ref()
-            .map(|dir| dir.join(".pi").join("settings.json"));
+            .map(|dir| dir.join(config::config_dir_name()).join("settings.json"));
         let global_settings = settings_path
             .as_ref()
             .map(|path| load_settings_from_file(path))
@@ -1483,14 +1506,11 @@ fn normalize_agent_dir(input: String) -> Option<PathBuf> {
     if !input.trim().is_empty() {
         return Some(PathBuf::from(input));
     }
-    env::var("PI_CODING_AGENT_DIR")
+    env::var(config::env_agent_dir_name())
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()?;
-            Some(PathBuf::from(home).join(".pi").join("agent"))
-        })
+        .or_else(|| Some(config::get_agent_dir()))
 }
 
 fn load_settings_from_file(path: &Path) -> Settings {

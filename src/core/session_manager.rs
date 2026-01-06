@@ -6,7 +6,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1433,14 +1432,5 @@ fn get_default_session_dir(cwd: &Path) -> PathBuf {
 }
 
 fn resolve_agent_dir() -> PathBuf {
-    if let Ok(dir) = env::var("PI_CODING_AGENT_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".pi").join("agent")
+    crate::config::get_agent_dir()
 }
