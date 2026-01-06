@@ -3,7 +3,7 @@ use crate::agent::{
     ThinkingLevel,
 };
 use crate::coding_agent::export_html::export_session_to_html;
-use crate::coding_agent::extension_host::ExtensionHost;
+use crate::coding_agent::extension_host::{ExtensionHost, ExtensionUiRequest, ExtensionUiResponse};
 use crate::coding_agent::hooks::{
     CompactionHook, CompactionResult, SessionBeforeCompactEvent, SessionCompactEvent,
 };
@@ -55,6 +55,23 @@ pub struct AgentSession {
     next_listener_id: Rc<RefCell<usize>>,
     unsubscribe_agent: Option<Box<dyn FnOnce()>>,
 }
+
+const THINKING_LEVELS: [ThinkingLevel; 5] = [
+    ThinkingLevel::Off,
+    ThinkingLevel::Minimal,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+];
+
+const THINKING_LEVELS_WITH_XHIGH: [ThinkingLevel; 6] = [
+    ThinkingLevel::Off,
+    ThinkingLevel::Minimal,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+    ThinkingLevel::XHigh,
+];
 
 impl AgentSession {
     pub fn new(config: AgentSessionConfig) -> Self {
@@ -305,6 +322,15 @@ impl AgentSession {
         self.compaction_hooks.push(hook);
         self.extension_host = Some(host);
         self.wrap_tools_with_extensions();
+    }
+
+    pub fn set_extension_ui_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(&ExtensionUiRequest) -> ExtensionUiResponse + 'static,
+    {
+        if let Some(host) = self.extension_host.as_ref() {
+            host.borrow_mut().set_ui_handler(handler);
+        }
     }
 
     fn wrap_tools_with_extensions(&mut self) {
@@ -594,28 +620,60 @@ impl AgentSession {
     }
 
     pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
-        self.agent.set_thinking_level(level);
+        let available = self.available_thinking_levels();
+        let effective = if available.contains(&level) {
+            level
+        } else {
+            clamp_thinking_level(level, &available)
+        };
+        self.agent.set_thinking_level(effective);
         self.session_manager
-            .append_thinking_level_change(level.as_str());
+            .append_thinking_level_change(effective.as_str());
+        self.settings_manager
+            .set_default_thinking_level(effective.as_str());
     }
 
     pub fn cycle_thinking_level(&mut self) -> ThinkingLevelCycleResult {
-        let levels = [
-            ThinkingLevel::Off,
-            ThinkingLevel::Minimal,
-            ThinkingLevel::Low,
-            ThinkingLevel::Medium,
-            ThinkingLevel::High,
-            ThinkingLevel::XHigh,
-        ];
+        let levels = self.available_thinking_levels();
         let current = self.agent.state().thinking_level;
         let index = levels
             .iter()
             .position(|level| *level == current)
             .unwrap_or(0);
-        let next = levels[(index + 1) % levels.len()];
+        let next = levels[index.saturating_add(1) % levels.len()];
         self.set_thinking_level(next);
-        ThinkingLevelCycleResult { level: next }
+        ThinkingLevelCycleResult {
+            level: self.agent.state().thinking_level,
+        }
+    }
+
+    fn available_thinking_levels(&self) -> Vec<ThinkingLevel> {
+        if !self.supports_thinking() {
+            return vec![ThinkingLevel::Off];
+        }
+        if self.supports_xhigh_thinking() {
+            THINKING_LEVELS_WITH_XHIGH.to_vec()
+        } else {
+            THINKING_LEVELS.to_vec()
+        }
+    }
+
+    fn supports_thinking(&self) -> bool {
+        self.current_registry_model()
+            .map(|model| model.reasoning)
+            .unwrap_or(false)
+    }
+
+    fn supports_xhigh_thinking(&self) -> bool {
+        self.current_registry_model()
+            .map(|model| supports_xhigh_thinking(&model))
+            .unwrap_or(false)
+    }
+
+    fn current_registry_model(&self) -> Option<crate::coding_agent::Model> {
+        let state = self.agent.state();
+        self.model_registry
+            .find(&state.model.provider, &state.model.id)
     }
 
     pub fn set_auto_compaction_enabled(&mut self, enabled: bool) {
@@ -1956,4 +2014,37 @@ fn thinking_level_from_str(level: &str) -> Option<ThinkingLevel> {
         "xhigh" => Some(ThinkingLevel::XHigh),
         _ => None,
     }
+}
+
+fn clamp_thinking_level(level: ThinkingLevel, available: &[ThinkingLevel]) -> ThinkingLevel {
+    if available.is_empty() {
+        return ThinkingLevel::Off;
+    }
+    if let Some(requested_index) = THINKING_LEVELS_WITH_XHIGH
+        .iter()
+        .position(|candidate| *candidate == level)
+    {
+        for candidate in THINKING_LEVELS_WITH_XHIGH.iter().skip(requested_index) {
+            if available.contains(candidate) {
+                return *candidate;
+            }
+        }
+        for candidate in THINKING_LEVELS_WITH_XHIGH
+            .iter()
+            .take(requested_index)
+            .rev()
+        {
+            if available.contains(candidate) {
+                return *candidate;
+            }
+        }
+    }
+    available[0]
+}
+
+fn supports_xhigh_thinking(model: &crate::coding_agent::Model) -> bool {
+    matches!(
+        model.id.as_str(),
+        "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex"
+    )
 }

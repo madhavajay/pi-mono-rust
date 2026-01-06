@@ -54,8 +54,7 @@ fn create_temp_dir(prefix: &str) -> PathBuf {
     dir
 }
 
-fn create_session(persist: bool, temp_dir: Option<&Path>) -> AgentSession {
-    let model = get_model("anthropic", "claude-sonnet-4-5");
+fn build_session(persist: bool, temp_dir: Option<&Path>, model: Model) -> AgentSession {
     let stream_fn: StreamFn = Box::new(move |_model, context| {
         let mut bash_output = None;
         for message in context.messages.iter().rev() {
@@ -122,6 +121,15 @@ fn create_session(persist: bool, temp_dir: Option<&Path>) -> AgentSession {
         settings_manager,
         model_registry,
     })
+}
+
+fn create_session(persist: bool, temp_dir: Option<&Path>) -> AgentSession {
+    let model = get_model("anthropic", "claude-sonnet-4-5");
+    build_session(persist, temp_dir, model)
+}
+
+fn create_session_with_model(model: Model) -> AgentSession {
+    build_session(false, None, model)
 }
 
 #[test]
@@ -250,6 +258,24 @@ fn should_cycle_thinking_level() {
     assert_ne!(result.level, initial);
     let state = session.get_state();
     assert_eq!(state.thinking_level, result.level);
+}
+
+#[test]
+fn should_clamp_thinking_level_for_non_reasoning_model() {
+    let model = get_model("openai", "gpt-4o-mini");
+    let mut session = create_session_with_model(model);
+    session.set_thinking_level(ThinkingLevel::High);
+    let state = session.get_state();
+    assert_eq!(state.thinking_level, ThinkingLevel::Off);
+}
+
+#[test]
+fn should_clamp_xhigh_to_high_when_unsupported() {
+    let model = get_model("anthropic", "claude-sonnet-4-5");
+    let mut session = create_session_with_model(model);
+    session.set_thinking_level(ThinkingLevel::XHigh);
+    let state = session.get_state();
+    assert_eq!(state.thinking_level, ThinkingLevel::High);
 }
 
 #[test]

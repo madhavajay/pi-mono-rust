@@ -263,6 +263,7 @@ fn load_built_in_models(
             "Claude Sonnet 4.5",
             "anthropic-messages",
             "https://api.anthropic.com/v1",
+            true,
         ),
         built_in_model(
             "anthropic",
@@ -270,6 +271,7 @@ fn load_built_in_models(
             "Claude 3.5 Haiku",
             "anthropic-messages",
             "https://api.anthropic.com/v1",
+            false,
         ),
         built_in_model(
             "google",
@@ -277,6 +279,7 @@ fn load_built_in_models(
             "Gemini 2.5 Flash",
             "google-generative-ai",
             "https://generativelanguage.googleapis.com",
+            true,
         ),
         built_in_model(
             "openai",
@@ -284,6 +287,7 @@ fn load_built_in_models(
             "GPT-4o mini",
             "openai-responses",
             "https://api.openai.com/v1",
+            false,
         ),
     ];
 
@@ -309,14 +313,21 @@ fn load_built_in_models(
     models
 }
 
-fn built_in_model(provider: &str, id: &str, name: &str, api: &str, base_url: &str) -> Model {
+fn built_in_model(
+    provider: &str,
+    id: &str,
+    name: &str,
+    api: &str,
+    base_url: &str,
+    reasoning: bool,
+) -> Model {
     Model {
         id: id.to_string(),
         name: name.to_string(),
         api: api.to_string(),
         provider: provider.to_string(),
         base_url: base_url.to_string(),
-        reasoning: false,
+        reasoning,
         input: vec!["text".to_string(), "image".to_string()],
         cost: Cost {
             input: 0.0,

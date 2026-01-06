@@ -126,6 +126,7 @@ Planned modules (initial, not final):
 - Print mode wired to Anthropic Messages API and OpenAI Responses API (non-streaming).
 - Auth reuse via `~/.pi/agent/auth.json` or `PI_CODING_AGENT_DIR` fallback.
 - Print mode uses AgentSession tool loop with built-in `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`.
+- Default tool allowlist now matches TS (`read`, `bash`, `edit`, `write`) with `grep`/`find`/`ls` opt-in; extension tools are included when `--tools` is not specified.
 - Grep now supports directory search with regex/literal matching plus truncation notices for grep/find/ls output.
 - Print mode now uses `AgentSession` with session persistence (`--continue`, `--session`, `--session-dir`, `--no-session`).
 - Session default directory respects `PI_CODING_AGENT_DIR` for `sessions/`.
@@ -136,6 +137,7 @@ Planned modules (initial, not final):
 - App config now reads `piConfig` from `package.json` when available (app name/config dir + env var), and project paths respect the configured dir name.
 - HTML export now uses the TS template assets with the default dark theme and supports CLI `--export` + RPC `export_html`.
 - CLI `--thinking` sets the initial thinking level and persists it to the session.
+- AgentSession now clamps thinking level to model capabilities (reasoning + xhigh) and persists default thinking level.
 - Settings manager now loads `settings.json` (global + project override) for compaction/retry/theme defaults and persists global updates.
 - RPC prompt streamingBehavior now matches TS (only queues when streaming; images are ignored during queueing).
 - RPC mode now supports `openai-responses` models alongside `anthropic-messages`.
@@ -147,6 +149,7 @@ Planned modules (initial, not final):
 - Added a Rust-side extension runner for JS extension metadata (tools/commands/flags/shortcuts/renderers), shortcut conflict warnings, context event emit, and error listeners.
 - Extension tool_call/tool_result hooks now wrap built-in tools, allowing extensions to block or override tool outputs.
 - Extension-registered tools now expose parameter schemas, are included in API tool specs, and execute via the JS extension host.
+- RPC mode now forwards extension UI requests/responses (select/confirm/input/editor + notify/status/widget/title/editor text) through the JS extension host.
 
 ## Test Plan
 ### Baseline (TS)
