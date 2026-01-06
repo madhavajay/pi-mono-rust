@@ -5,8 +5,8 @@ use pi::agent::{
 use pi::cli::list_models::list_models;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
-    build_system_prompt, AgentSession, AgentSessionConfig, AuthCredential, AuthStorage,
-    BuildSystemPromptOptions, Model as RegistryModel, ModelRegistry, SettingsManager,
+    build_system_prompt, export_from_file, AgentSession, AgentSessionConfig, AuthCredential,
+    AuthStorage, BuildSystemPromptOptions, Model as RegistryModel, ModelRegistry, SettingsManager,
 };
 use pi::core::messages::{
     AgentMessage as CoreAgentMessage, AssistantMessage, ContentBlock, Cost, ToolResultMessage,
@@ -49,6 +49,7 @@ Options:
   --tools          Comma-separated tool allowlist
   --print, -p      Print mode (single-shot)
   --list-models    List available models
+  --export <file>  Export session file to HTML and exit
   --mode <mode>    Output mode: text (default), json, rpc
   --no-skills      Disable skills discovery and loading
   --skills         Comma-separated glob patterns to filter skills
@@ -56,7 +57,7 @@ Options:
 
 Notes:
   Interactive mode is not implemented yet.
-  --resume, --hook, --tool, --export are not implemented yet."
+  --resume, --hook, --tool are not implemented yet."
     );
 }
 
@@ -74,9 +75,6 @@ fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
     }
     if parsed.custom_tools.is_some() {
         unsupported.push("--tool");
-    }
-    if parsed.export.is_some() {
-        unsupported.push("--export");
     }
     unsupported
 }
@@ -1224,6 +1222,20 @@ fn main() {
         };
         list_models(&registry, search_pattern);
         return;
+    }
+
+    if let Some(export_path) = &parsed.export {
+        let output_path = parsed.messages.first().map(PathBuf::from);
+        match export_from_file(Path::new(export_path), output_path) {
+            Ok(path) => {
+                println!("Exported to: {}", path.display());
+                return;
+            }
+            Err(message) => {
+                eprintln!("Error: {message}");
+                process::exit(1);
+            }
+        }
     }
 
     let unsupported = collect_unsupported_flags(&parsed);

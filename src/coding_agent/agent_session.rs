@@ -1,4 +1,5 @@
 use crate::agent::{Agent, AgentError, AgentEvent, AgentMessage, CustomMessage, ThinkingLevel};
+use crate::coding_agent::export_html::export_session_to_html;
 use crate::coding_agent::hooks::{
     CompactionHook, CompactionResult, SessionBeforeCompactEvent, SessionCompactEvent,
 };
@@ -10,7 +11,6 @@ use crate::core::messages::{
 use crate::core::session_manager::{BranchSummaryEntry, SessionEntry, SessionManager};
 use serde::Serialize;
 use std::cell::{Cell, RefCell};
-use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
@@ -640,23 +640,10 @@ impl AgentSession {
         &self,
         output_path: Option<&PathBuf>,
     ) -> Result<ExportResult, AgentSessionError> {
-        let path = match output_path {
-            Some(path) => path.clone(),
-            None => {
-                let dir = self.session_manager.get_session_dir();
-                let filename = format!("session-{}.html", self.session_manager.get_session_id());
-                dir.join(filename)
-            }
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                return Err(AgentSessionError::Session(err.to_string()));
-            }
-        }
-        let html = "<html><body><p>Session export</p></body></html>";
-        if let Err(err) = fs::write(&path, html) {
-            return Err(AgentSessionError::Session(err.to_string()));
-        }
+        let state = self.agent.state();
+        let output_path = output_path.cloned();
+        let path = export_session_to_html(&self.session_manager, Some(&state), output_path)
+            .map_err(AgentSessionError::Session)?;
         Ok(ExportResult { path })
     }
 

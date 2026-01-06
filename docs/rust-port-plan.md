@@ -130,6 +130,7 @@ Planned modules (initial, not final):
 - Session default directory respects `PI_CODING_AGENT_DIR` for `sessions/`.
 - Bash tool now truncates tail output with temp file preservation when output exceeds limits.
 - System prompt builder now mirrors TS defaults (tools/guidelines, project context files, skills; `--skills`/`--no-skills`).
+- HTML export now uses the TS template assets with the default dark theme and supports CLI `--export` + RPC `export_html`.
 
 ## Test Plan
 ### Baseline (TS)

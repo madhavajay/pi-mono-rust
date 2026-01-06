@@ -1,3 +1,4 @@
+pub mod export_html;
 pub mod fuzzy;
 pub mod tools;
 
@@ -19,6 +20,7 @@ pub use agent_session::{
     ThinkingLevelCycleResult, TokenStats,
 };
 pub use auth_storage::{AuthCredential, AuthStorage};
+pub use export_html::{export_from_file, export_session_to_html};
 pub use hooks::{
     CompactionHook, CompactionResult, HookAPI, HookContext, SessionBeforeCompactEvent,
     SessionBeforeCompactResult, SessionCompactEvent,
