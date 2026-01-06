@@ -7,7 +7,12 @@ use crate::coding_agent::{
 };
 use crate::config;
 use crate::core::session_manager::{SessionInfo, SessionManager};
+use crate::tui::SessionSelectorComponent;
 use crate::{Args, ListModels};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::ExecutableCommand;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
@@ -147,14 +152,125 @@ pub fn select_resume_session(
         return Ok(None);
     }
 
-    let selection = prompt_for_session(&sessions)?;
-    if selection.is_none() {
-        println!("No session selected");
+    // Try TUI-based selection first, fall back to line-based if terminal not available
+    match select_session_tui(&sessions) {
+        Ok(Some(path)) => Ok(Some(path)),
+        Ok(None) => {
+            println!("No session selected");
+            Ok(None)
+        }
+        Err(_) => {
+            // Fall back to simple line-based selection
+            let selection = prompt_for_session_simple(&sessions)?;
+            if selection.is_none() {
+                println!("No session selected");
+            }
+            Ok(selection)
+        }
     }
-    Ok(selection)
 }
 
-fn prompt_for_session(sessions: &[SessionInfo]) -> Result<Option<PathBuf>, String> {
+/// TUI-based session selector using the SessionSelectorComponent
+fn select_session_tui(sessions: &[SessionInfo]) -> Result<Option<PathBuf>, String> {
+    let mut stdout = io::stdout();
+
+    // Enter raw mode and alternate screen
+    terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+    stdout
+        .execute(EnterAlternateScreen)
+        .map_err(|e| e.to_string())?;
+    stdout.execute(Hide).map_err(|e| e.to_string())?;
+
+    let result = run_session_selector_loop(sessions, &mut stdout);
+
+    // Clean up terminal state
+    let _ = stdout.execute(Show);
+    let _ = stdout.execute(LeaveAlternateScreen);
+    let _ = terminal::disable_raw_mode();
+
+    result
+}
+
+fn run_session_selector_loop(
+    sessions: &[SessionInfo],
+    stdout: &mut impl Write,
+) -> Result<Option<PathBuf>, String> {
+    use crossterm::cursor::MoveTo;
+
+    let (width, height) = terminal::size().map_err(|e| e.to_string())?;
+    let width = width.max(1) as usize;
+    let height = height.max(1) as usize;
+
+    // Calculate max visible sessions based on terminal height
+    // Each session takes 3 lines (message + metadata + blank)
+    // Plus header (~6 lines) and footer (~2 lines)
+    let max_visible = ((height.saturating_sub(10)) / 3).max(3);
+
+    let mut selector = SessionSelectorComponent::new(sessions.to_vec(), max_visible);
+
+    // Main render/event loop
+    loop {
+        // Render
+        stdout.execute(MoveTo(0, 0)).map_err(|e| e.to_string())?;
+        stdout
+            .execute(Clear(ClearType::All))
+            .map_err(|e| e.to_string())?;
+
+        let lines = selector.render(width);
+        for (idx, line) in lines.iter().enumerate() {
+            if idx >= height {
+                break;
+            }
+            if idx + 1 == lines.len().min(height) {
+                write!(stdout, "{}", line).map_err(|e| e.to_string())?;
+            } else {
+                writeln!(stdout, "{}", line).map_err(|e| e.to_string())?;
+            }
+        }
+        stdout.flush().map_err(|e| e.to_string())?;
+
+        // Poll for events
+        if event::poll(std::time::Duration::from_millis(100)).map_err(|e| e.to_string())? {
+            if let Event::Key(key_event) = event::read().map_err(|e| e.to_string())? {
+                // Check for Ctrl+C to exit
+                if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    && key_event.code == KeyCode::Char('c')
+                {
+                    return Ok(None);
+                }
+
+                let list = selector.session_list_mut();
+
+                // Handle key
+                match key_event.code {
+                    KeyCode::Up => {
+                        list.handle_input("\x1b[A");
+                    }
+                    KeyCode::Down => {
+                        list.handle_input("\x1b[B");
+                    }
+                    KeyCode::Enter => {
+                        // Get selected session directly
+                        return Ok(list.get_selected());
+                    }
+                    KeyCode::Esc => {
+                        return Ok(None);
+                    }
+                    KeyCode::Backspace => {
+                        list.handle_input("\x7f");
+                    }
+                    KeyCode::Char(c) => {
+                        list.handle_input(&c.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Simple line-based session selection fallback
+fn prompt_for_session_simple(sessions: &[SessionInfo]) -> Result<Option<PathBuf>, String> {
     println!("Select a session to resume:");
     for (idx, session) in sessions.iter().enumerate() {
         let preview = truncate_preview(&session.first_message, 80);

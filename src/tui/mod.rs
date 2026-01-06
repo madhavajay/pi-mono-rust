@@ -7,8 +7,9 @@ pub mod utils;
 pub use autocomplete::{AutocompleteItem, AutocompleteSuggestions, CombinedAutocompleteProvider};
 pub use components::{
     Component, Container, DefaultTextStyle, Editor, EditorTheme, Expandable, ExpandableText,
-    FilterMode, Image, ImageOptions, ImageTheme, Markdown, MarkdownTheme, Spacer, Text,
-    ToolPreviewConfig, TreeList, TreeSelectorComponent, TruncatedText,
+    FilterMode, Image, ImageOptions, ImageTheme, Markdown, MarkdownTheme, SessionList,
+    SessionSelectorComponent, Spacer, Text, ToolPreviewConfig, TreeList, TreeSelectorComponent,
+    TruncatedText,
 };
 pub use keys::{is_kitty_protocol_active, matches_key, parse_key, set_kitty_protocol_active};
 pub use terminal_image::{

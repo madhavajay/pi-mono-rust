@@ -204,10 +204,18 @@ Planned modules (initial, not final):
   - Keyboard navigation (up/down, page up/down with left/right).
   - Label editing support (press 'l' to edit).
   - TreeSelectorComponent wrapper with header and search UI.
+- **Session selector component for resuming sessions**:
+  - `tui/components/session_selector.rs`: TUI-based session picker for `--resume` flag.
+  - Multi-line session display (first message + metadata with relative timestamps).
+  - Search filtering for session list.
+  - Keyboard navigation (up/down arrows, enter to select, escape to cancel).
+  - Scroll indicator for long session lists.
+  - Integrated into `cli/runtime.rs::select_resume_session()` with fallback to line-based UI.
+  - Unit tests covering filtering, navigation, rendering, and component structure.
 
 ## Remaining Gaps (Next)
-- Interactive TUI parity: session selector (for resuming sessions), theme reload with file watcher, input component improvements.
-- TS extensions support in the JS host (jiti-based loading) + parity tests.
+- Interactive TUI parity: theme reload with file watcher, input component improvements.
+- TS extensions parity tests (jiti loading already works when jiti is available in project).
 
 ## Test Plan
 ### Baseline (TS)
