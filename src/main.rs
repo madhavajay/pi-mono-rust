@@ -4,7 +4,8 @@ use pi::agent::{
 };
 use pi::cli::args::{ExtensionFlagType, ExtensionFlagValue, ThinkingLevel as CliThinkingLevel};
 use pi::cli::list_models::list_models;
-use pi::coding_agent::extension_host::ExtensionTool;
+use pi::coding_agent::extension_host::{ExtensionTool, ExtensionUiRequest, ExtensionUiResponse};
+use pi::coding_agent::interactive_mode::format_message_for_interactive;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
     build_system_prompt, export_from_file, load_prompt_templates, AgentSession, AgentSessionConfig,
@@ -18,7 +19,7 @@ use pi::core::messages::{
     Usage, UserContent,
 };
 use pi::core::session_manager::{SessionInfo, SessionManager};
-use pi::tools::default_tools;
+use pi::tools::{default_tool_names, default_tools};
 use pi::tui::{truncate_to_width, wrap_text_with_ansi, Editor, EditorTheme};
 use pi::{parse_args, Args, ListModels, Mode};
 use reqwest::blocking::Client;
@@ -32,6 +33,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::rc::Rc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -253,6 +255,18 @@ struct RpcNewSessionCommand {
     id: Option<String>,
     #[serde(rename = "parentSession")]
     parent_session: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcExtensionUiResponse {
+    id: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    confirmed: Option<bool>,
+    #[serde(default)]
+    cancelled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1080,32 +1094,6 @@ fn build_user_entry(message: Option<&str>, images: &[FileInputImage]) -> String 
     }
 }
 
-fn last_assistant_text(session: &AgentSession) -> Result<String, String> {
-    let messages = session.messages();
-    let assistant = messages.iter().rev().find_map(|message| {
-        if let AgentMessage::Assistant(assistant) = message {
-            Some(assistant)
-        } else {
-            None
-        }
-    });
-
-    let assistant = assistant.ok_or_else(|| "No assistant response.".to_string())?;
-    if assistant.stop_reason == "error" || assistant.stop_reason == "aborted" {
-        return Err(assistant
-            .error_message
-            .clone()
-            .unwrap_or_else(|| format!("Request {}", assistant.stop_reason)));
-    }
-    let mut text = String::new();
-    for block in &assistant.content {
-        if let ContentBlock::Text { text: chunk, .. } = block {
-            text.push_str(chunk);
-        }
-    }
-    Ok(text)
-}
-
 fn prompt_and_append_text(
     session: &mut AgentSession,
     entries: &mut Vec<String>,
@@ -1113,6 +1101,7 @@ fn prompt_and_append_text(
     stdout: &mut impl Write,
     prompt: &str,
 ) -> Result<(), String> {
+    let start_index = session.messages().len();
     entries.push(format!("You:\n{prompt}"));
     entries.push("Assistant:\n...".to_string());
     render_interactive_ui(entries, editor, stdout)?;
@@ -1126,9 +1115,12 @@ fn prompt_and_append_text(
         return Err(err.to_string());
     }
 
-    let response = last_assistant_text(session)?;
-    if let Some(entry) = entries.last_mut() {
-        *entry = format!("Assistant:\n{response}");
+    let new_entries = collect_new_interactive_entries(session, start_index);
+    entries.pop();
+    if new_entries.is_empty() {
+        entries.push("Assistant:\n[no response]".to_string());
+    } else {
+        entries.extend(new_entries);
     }
     render_interactive_ui(entries, editor, stdout)?;
     Ok(())
@@ -1142,6 +1134,7 @@ fn prompt_and_append_content(
     prompt: &str,
     content: UserContent,
 ) -> Result<(), String> {
+    let start_index = session.messages().len();
     entries.push(format!("You:\n{prompt}"));
     entries.push("Assistant:\n...".to_string());
     render_interactive_ui(entries, editor, stdout)?;
@@ -1155,12 +1148,26 @@ fn prompt_and_append_content(
         return Err(err.to_string());
     }
 
-    let response = last_assistant_text(session)?;
-    if let Some(entry) = entries.last_mut() {
-        *entry = format!("Assistant:\n{response}");
+    let new_entries = collect_new_interactive_entries(session, start_index);
+    entries.pop();
+    if new_entries.is_empty() {
+        entries.push("Assistant:\n[no response]".to_string());
+    } else {
+        entries.extend(new_entries);
     }
     render_interactive_ui(entries, editor, stdout)?;
     Ok(())
+}
+
+fn collect_new_interactive_entries(session: &AgentSession, start_index: usize) -> Vec<String> {
+    let messages = session.messages();
+    let mut entries = Vec::new();
+    for message in messages.iter().skip(start_index) {
+        if let Some(entry) = format_message_for_interactive(message, false) {
+            entries.push(entry);
+        }
+    }
+    entries
 }
 
 fn handle_key_event(key: KeyEvent, editor: &mut Editor) -> EditorAction {
@@ -1873,21 +1880,16 @@ fn main() {
     let extension_host = preloaded_extension
         .as_ref()
         .map(|preloaded| preloaded.host.clone());
-    let mut prompt_tools = parsed.tools.clone().unwrap_or_else(|| {
-        default_tools()
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect()
-    });
+    let mut selected_tools = parsed.tools.clone().unwrap_or_else(default_tool_names);
     if parsed.tools.is_none() {
         for tool in &extension_tools {
-            prompt_tools.push(tool.name.clone());
+            selected_tools.push(tool.name.clone());
         }
     }
     let system_prompt = build_system_prompt(BuildSystemPromptOptions {
         custom_prompt: system_prompt_source,
         append_system_prompt: parsed.append_system_prompt.clone(),
-        selected_tools: Some(prompt_tools),
+        selected_tools: Some(selected_tools.clone()),
         skills_enabled: !parsed.no_skills,
         skills_include: skill_patterns,
         cwd: Some(cwd.clone()),
@@ -1923,7 +1925,7 @@ fn main() {
             registry,
             Some(system_prompt),
             None,
-            parsed.tools.as_deref(),
+            Some(selected_tools.as_slice()),
             &extension_tools,
             extension_host.clone(),
             parsed.api_key.as_deref(),
@@ -1976,7 +1978,7 @@ fn main() {
         registry,
         Some(system_prompt),
         None,
-        parsed.tools.as_deref(),
+        Some(selected_tools.as_slice()),
         &extension_tools,
         extension_host.clone(),
         parsed.api_key.as_deref(),
@@ -2045,6 +2047,59 @@ fn select_model(parsed: &Args, registry: &ModelRegistry) -> Result<RegistryModel
         .ok_or_else(|| "No models available. Set an API key in auth.json or env.".to_string())
 }
 
+fn extension_ui_request_to_value(request: &ExtensionUiRequest) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "type".to_string(),
+        Value::String("extension_ui_request".to_string()),
+    );
+    map.insert("id".to_string(), Value::String(request.id.clone()));
+    map.insert("method".to_string(), Value::String(request.method.clone()));
+    if let Some(title) = &request.title {
+        map.insert("title".to_string(), Value::String(title.clone()));
+    }
+    if let Some(message) = &request.message {
+        map.insert("message".to_string(), Value::String(message.clone()));
+    }
+    if let Some(options) = &request.options {
+        map.insert(
+            "options".to_string(),
+            Value::Array(options.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    if let Some(placeholder) = &request.placeholder {
+        map.insert(
+            "placeholder".to_string(),
+            Value::String(placeholder.clone()),
+        );
+    }
+    if let Some(prefill) = &request.prefill {
+        map.insert("prefill".to_string(), Value::String(prefill.clone()));
+    }
+    if let Some(notify_type) = &request.notify_type {
+        map.insert("notifyType".to_string(), Value::String(notify_type.clone()));
+    }
+    if let Some(status_key) = &request.status_key {
+        map.insert("statusKey".to_string(), Value::String(status_key.clone()));
+    }
+    if let Some(status_text) = &request.status_text {
+        map.insert("statusText".to_string(), Value::String(status_text.clone()));
+    }
+    if let Some(widget_key) = &request.widget_key {
+        map.insert("widgetKey".to_string(), Value::String(widget_key.clone()));
+    }
+    if let Some(widget_lines) = &request.widget_lines {
+        map.insert(
+            "widgetLines".to_string(),
+            Value::Array(widget_lines.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    if let Some(text) = &request.text {
+        map.insert("text".to_string(), Value::String(text.clone()));
+    }
+    Value::Object(map)
+}
+
 fn run_rpc_mode(mut session: pi::coding_agent::AgentSession) -> Result<(), String> {
     let _unsubscribe = session.subscribe(|event| {
         if let Some(value) = serialize_agent_event(event) {
@@ -2052,29 +2107,100 @@ fn run_rpc_mode(mut session: pi::coding_agent::AgentSession) -> Result<(), Strin
         }
     });
 
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(err) => return Err(format!("Failed to read stdin: {err}")),
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    let pending_ui: Arc<Mutex<HashMap<String, mpsc::Sender<RpcExtensionUiResponse>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (command_tx, command_rx) = mpsc::channel::<Value>();
 
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(err) => {
-                emit_json(&response_error(
-                    None,
-                    "parse",
-                    &format!("Failed to parse command: {err}"),
-                ));
+    let pending_ui_reader = pending_ui.clone();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => break,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-        };
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(_) => {
+                    let _ = command_tx.send(json!({
+                        "type": "parse_error",
+                        "error": format!("Failed to parse command: {trimmed}")
+                    }));
+                    continue;
+                }
+            };
+            if value
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "extension_ui_response")
+            {
+                if let Ok(response) = serde_json::from_value::<RpcExtensionUiResponse>(value) {
+                    if let Some(sender) = pending_ui_reader
+                        .lock()
+                        .ok()
+                        .and_then(|mut map| map.remove(&response.id))
+                    {
+                        let _ = sender.send(response);
+                    }
+                }
+                continue;
+            }
+            if command_tx.send(value).is_err() {
+                break;
+            }
+        }
+    });
 
+    let pending_ui_handler = pending_ui.clone();
+    session.set_extension_ui_handler(move |request| {
+        let request_value = extension_ui_request_to_value(request);
+        let method = request.method.as_str();
+        if matches!(
+            method,
+            "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text"
+        ) {
+            emit_json(&request_value);
+            return ExtensionUiResponse {
+                cancelled: Some(true),
+                ..Default::default()
+            };
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut map) = pending_ui_handler.lock() {
+            map.insert(request.id.clone(), sender);
+        }
+        emit_json(&request_value);
+        match receiver.recv() {
+            Ok(response) => ExtensionUiResponse {
+                value: response.value,
+                confirmed: response.confirmed,
+                cancelled: response.cancelled,
+            },
+            Err(_) => ExtensionUiResponse {
+                cancelled: Some(true),
+                ..Default::default()
+            },
+        }
+    });
+
+    while let Ok(value) = command_rx.recv() {
+        if value
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "parse_error")
+        {
+            let message = value
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Failed to parse command");
+            emit_json(&response_error(None, "parse", message));
+            continue;
+        }
         let envelope: RpcCommandEnvelope = match serde_json::from_value(value.clone()) {
             Ok(envelope) => envelope,
             Err(err) => {
@@ -2939,7 +3065,13 @@ fn build_agent_tools(
             }
             names.to_vec()
         }
-        None => available_set.into_iter().collect(),
+        None => {
+            let mut defaults = default_tool_names();
+            for tool in extension_tools {
+                defaults.push(tool.name.clone());
+            }
+            defaults
+        }
     };
 
     let selected_set = selected.iter().cloned().collect::<HashSet<_>>();

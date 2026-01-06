@@ -142,6 +142,7 @@ Planned modules (initial, not final):
 - RPC prompt streamingBehavior now matches TS (only queues when streaming; images are ignored during queueing).
 - RPC mode now supports `openai-responses` models alongside `anthropic-messages`.
 - Interactive mode now uses a basic TUI (chat history + editor) over raw terminal input (full parity pending).
+- Interactive mode now renders assistant tool calls/results, thinking blocks, and bash execution messages instead of text-only output.
 - CLI `--resume` now lists available sessions and prompts for a selection in the line-based UI.
 - CLI now parses `--extension`/`-e` and persists extension paths to settings; JS extensions can now run compaction hooks via the Node host (TS support pending).
 - Extension discovery now scans global/project directories plus configured paths and hands JS/TS extensions to the host (TS uses `jiti` when available).
