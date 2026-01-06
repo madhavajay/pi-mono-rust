@@ -1528,22 +1528,21 @@ fn handle_rpc_command(
 
             let mut handle_prompt = || {
                 if let Some(behavior) = command.streaming_behavior.as_deref() {
-                    if !command.images.is_empty() {
-                        return Err("streamingBehavior does not support images yet.".to_string());
-                    }
-                    match behavior {
-                        "steer" => {
-                            session.steer(&command.message);
-                            return Ok(());
-                        }
-                        "followUp" | "follow_up" => {
-                            session.follow_up(&command.message);
-                            return Ok(());
-                        }
-                        other => {
-                            return Err(format!(
-                                "Unknown streamingBehavior \"{other}\". Use \"steer\" or \"followUp\"."
-                            ));
+                    if session.is_streaming() {
+                        match behavior {
+                            "steer" => {
+                                session.steer(&command.message);
+                                return Ok(());
+                            }
+                            "followUp" | "follow_up" => {
+                                session.follow_up(&command.message);
+                                return Ok(());
+                            }
+                            other => {
+                                return Err(format!(
+                                    "Unknown streamingBehavior \"{other}\". Use \"steer\" or \"followUp\"."
+                                ));
+                            }
                         }
                     }
                 }
