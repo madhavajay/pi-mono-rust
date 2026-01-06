@@ -16,6 +16,7 @@ pub mod prompt_templates;
 pub mod skills;
 pub mod slash_commands;
 pub mod system_prompt;
+pub mod theme;
 
 pub use agent_session::{
     AgentSession, AgentSessionConfig, AgentSessionError, AgentSessionEvent, AgentSessionState,
@@ -51,4 +52,8 @@ pub use slash_commands::{parse_command_args, substitute_args};
 pub use system_prompt::{
     build_system_prompt, load_project_context_files, BuildSystemPromptOptions, ContextFile,
     LoadContextFilesOptions,
+};
+pub use theme::{
+    available_themes, load_theme, load_theme_or_default, set_active_theme, Theme, ThemeBg,
+    ThemeColor,
 };

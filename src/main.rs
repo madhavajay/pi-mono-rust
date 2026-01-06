@@ -8,9 +8,10 @@ use pi::coding_agent::extension_host::{ExtensionTool, ExtensionUiRequest, Extens
 use pi::coding_agent::interactive_mode::format_message_for_interactive;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
-    build_system_prompt, export_from_file, load_prompt_templates, AgentSession, AgentSessionConfig,
-    AuthCredential, AuthStorage, BuildSystemPromptOptions, ExtensionHost,
-    LoadPromptTemplatesOptions, Model as RegistryModel, ModelRegistry, SettingsManager,
+    build_system_prompt, export_from_file, load_prompt_templates, load_theme_or_default,
+    set_active_theme, AgentSession, AgentSessionConfig, AuthCredential, AuthStorage,
+    BuildSystemPromptOptions, ExtensionHost, LoadPromptTemplatesOptions, Model as RegistryModel,
+    ModelRegistry, SettingsManager,
 };
 use pi::coding_agent::{discover_extension_paths, ExtensionManifest};
 use pi::config;
@@ -20,7 +21,7 @@ use pi::core::messages::{
 };
 use pi::core::session_manager::{SessionInfo, SessionManager};
 use pi::tools::{default_tool_names, default_tools};
-use pi::tui::{truncate_to_width, wrap_text_with_ansi, Editor, EditorTheme};
+use pi::tui::{truncate_to_width, wrap_text_with_ansi, Editor};
 use pi::{parse_args, Args, ListModels, Mode};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -1239,9 +1240,9 @@ fn run_interactive_mode_session(
     initial_images: &[FileInputImage],
 ) -> Result<(), String> {
     let mut entries = Vec::new();
-    let mut editor = Editor::new(EditorTheme {
-        border_color: |text| text.to_string(),
-    });
+    let theme = load_theme_or_default(session.settings_manager.get_theme().as_deref());
+    set_active_theme(theme.clone());
+    let mut editor = Editor::new(theme.editor_theme());
 
     let mut stdout = io::stdout();
     let _guard = TerminalGuard::enter(&mut stdout)?;

@@ -151,6 +151,7 @@ Planned modules (initial, not final):
 - Extension tool_call/tool_result hooks now wrap built-in tools, allowing extensions to block or override tool outputs.
 - Extension-registered tools now expose parameter schemas, are included in API tool specs, and execute via the JS extension host.
 - RPC mode now forwards extension UI requests/responses (select/confirm/input/editor + notify/status/widget/title/editor text) through the JS extension host.
+- Theme JSON loading is available for interactive mode (built-in + custom theme directories), with editor border styling wired to theme colors.
 
 ## Test Plan
 ### Baseline (TS)
