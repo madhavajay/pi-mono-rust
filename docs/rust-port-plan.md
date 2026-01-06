@@ -179,10 +179,10 @@ Planned modules (initial, not final):
   - Row calculation: Scales image to target width cells with configurable cell dimensions.
   - Image component: TUI component with fallback text for unsupported terminals.
   - **Tests ported from TS**: `tests/tui_terminal_image_test.rs` covers Kitty/iTerm2 encoding, dimension parsing for all formats, row calculation, and fallback text (matching `image-test.ts`).
+  - Interactive mode wired to render images inline when `show-images` setting is true and terminal supports images.
 
 ## Remaining Gaps (Next)
 - Interactive TUI parity: selectors/keybindings, tool output expansion, session tree UX, theme reload.
-- Wire Image component into interactive mode (rendering images in chat).
 - TS extensions support in the JS host (jiti-based loading) + parity tests.
 
 ## Test Plan
