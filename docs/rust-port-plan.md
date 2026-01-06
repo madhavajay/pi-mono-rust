@@ -125,6 +125,7 @@ Planned modules (initial, not final):
 - Print mode wired to Anthropic Messages API and OpenAI Responses API (non-streaming).
 - Auth reuse via `~/.pi/agent/auth.json` or `PI_CODING_AGENT_DIR` fallback.
 - Minimal tool calling loop in print mode with built-in `read`, `write`, `edit`, `bash`.
+- Grep now supports directory search with regex/literal matching plus truncation notices for grep/find/ls output.
 
 ## Test Plan
 ### Baseline (TS)

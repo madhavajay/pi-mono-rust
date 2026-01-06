@@ -1,4 +1,5 @@
 use crate::core::messages::ContentBlock;
+use regex::RegexBuilder;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -434,15 +435,14 @@ impl GrepTool {
             .map_err(|_| format!("Path not found: {}", search_path.display()))?;
         let effective_limit = args.limit.unwrap_or(100).max(1);
         let context = args.context.unwrap_or(0);
-        let pattern = if args.ignore_case.unwrap_or(false) {
-            args.pattern.to_lowercase()
-        } else {
-            args.pattern.clone()
-        };
+        let ignore_case = args.ignore_case.unwrap_or(false);
+        let literal = args.literal.unwrap_or(false);
+        let matcher = build_grep_matcher(&args.pattern, ignore_case, literal)?;
 
         let mut matches_output = Vec::new();
         let mut match_count = 0usize;
         let mut match_limit_reached = false;
+        let mut lines_truncated = false;
 
         if metadata.is_file() {
             let content = fs::read_to_string(&search_path)
@@ -455,45 +455,69 @@ impl GrepTool {
                 .unwrap_or_else(|| search_path.display().to_string());
 
             for (idx, line) in lines.iter().enumerate() {
-                let haystack = if args.ignore_case.unwrap_or(false) {
-                    line.to_lowercase()
-                } else {
-                    (*line).to_string()
-                };
-                if haystack.contains(&pattern) {
+                if matcher.is_match(line) {
                     match_count += 1;
                     let line_number = idx + 1;
-                    let start = if context > 0 {
-                        line_number.saturating_sub(context)
-                    } else {
-                        line_number
-                    };
-                    let end = if context > 0 {
-                        (line_number + context).min(lines.len())
-                    } else {
-                        line_number
-                    };
-
-                    for current in start..=end {
-                        let text_line = lines.get(current - 1).copied().unwrap_or("");
-                        let sanitized = text_line.replace('\r', "");
-                        let (trimmed, _was_truncated) =
-                            truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
-                        if current == line_number {
-                            matches_output.push(format!("{file_label}:{current}: {trimmed}"));
-                        } else {
-                            matches_output.push(format!("{file_label}-{current}- {trimmed}"));
-                        }
-                    }
-
+                    append_grep_block(
+                        &file_label,
+                        &lines,
+                        line_number,
+                        context,
+                        &mut matches_output,
+                        &mut lines_truncated,
+                    );
                     if match_count >= effective_limit {
                         match_limit_reached = true;
                         break;
                     }
                 }
             }
+        } else if metadata.is_dir() {
+            let ignore_set = read_gitignore(&search_path);
+            let mut files = Vec::new();
+            collect_grep_files(
+                &search_path,
+                &search_path,
+                args.glob.as_deref(),
+                &ignore_set,
+                &mut files,
+            );
+            files.sort();
+            for rel in files {
+                let file_path = search_path.join(&rel);
+                let content = match fs::read_to_string(&file_path) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+                let normalized = normalize_to_lf(&content);
+                let lines: Vec<&str> = normalized.split('\n').collect();
+                for (idx, line) in lines.iter().enumerate() {
+                    if matcher.is_match(line) {
+                        match_count += 1;
+                        let line_number = idx + 1;
+                        append_grep_block(
+                            &rel,
+                            &lines,
+                            line_number,
+                            context,
+                            &mut matches_output,
+                            &mut lines_truncated,
+                        );
+                        if match_count >= effective_limit {
+                            match_limit_reached = true;
+                            break;
+                        }
+                    }
+                }
+                if match_limit_reached {
+                    break;
+                }
+            }
         } else {
-            return Err("Directory search is not implemented yet.".to_string());
+            return Err(format!(
+                "Not a file or directory: {}",
+                search_path.display()
+            ));
         }
 
         if match_count == 0 {
@@ -506,13 +530,35 @@ impl GrepTool {
             });
         }
 
-        let mut output = matches_output.join("\n");
+        let raw_output = matches_output.join("\n");
+        let truncation = truncate_head(raw_output.as_str(), Some((usize::MAX, DEFAULT_MAX_BYTES)));
+        let mut output = truncation.content.clone();
+
+        let mut notices = Vec::new();
+        let mut details = serde_json::Map::new();
+
         if match_limit_reached {
-            output.push_str(&format!(
-                "\n\n[{} matches limit reached. Use limit={} for more, or refine pattern]",
-                effective_limit,
+            notices.push(format!(
+                "{effective_limit} matches limit reached. Use limit={} for more, or refine pattern",
                 effective_limit * 2
             ));
+            details.insert("matchLimitReached".to_string(), json!(effective_limit));
+        }
+
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details.insert("truncation".to_string(), json!(truncation));
+        }
+
+        if lines_truncated {
+            notices.push(format!(
+                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+            ));
+            details.insert("linesTruncated".to_string(), json!(true));
+        }
+
+        if !notices.is_empty() {
+            output.push_str(&format!("\n\n[{}]", notices.join(". ")));
         }
 
         Ok(ToolResult {
@@ -520,7 +566,11 @@ impl GrepTool {
                 text: output,
                 text_signature: None,
             }],
-            details: None,
+            details: if details.is_empty() {
+                None
+            } else {
+                Some(Value::Object(details))
+            },
         })
     }
 }
@@ -555,16 +605,45 @@ impl FindTool {
         }
 
         results.sort();
-        if results.len() > effective_limit {
+        let result_limit_reached = results.len() > effective_limit;
+        if result_limit_reached {
             results.truncate(effective_limit);
+        }
+
+        let raw_output = results.join("\n");
+        let truncation = truncate_head(raw_output.as_str(), Some((usize::MAX, DEFAULT_MAX_BYTES)));
+        let mut output = truncation.content.clone();
+
+        let mut notices = Vec::new();
+        let mut details = serde_json::Map::new();
+
+        if result_limit_reached {
+            notices.push(format!(
+                "{effective_limit} results limit reached. Use limit={} for more, or refine pattern",
+                effective_limit * 2
+            ));
+            details.insert("resultLimitReached".to_string(), json!(effective_limit));
+        }
+
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details.insert("truncation".to_string(), json!(truncation));
+        }
+
+        if !notices.is_empty() {
+            output.push_str(&format!("\n\n[{}]", notices.join(". ")));
         }
 
         Ok(ToolResult {
             content: vec![ContentBlock::Text {
-                text: results.join("\n"),
+                text: output,
                 text_signature: None,
             }],
-            details: None,
+            details: if details.is_empty() {
+                None
+            } else {
+                Some(Value::Object(details))
+            },
         })
     }
 }
@@ -599,7 +678,8 @@ impl LsTool {
         }
 
         entries.sort_by_key(|a| a.to_lowercase());
-        if entries.len() > effective_limit {
+        let entry_limit_reached = entries.len() > effective_limit;
+        if entry_limit_reached {
             entries.truncate(effective_limit);
         }
 
@@ -609,12 +689,48 @@ impl LsTool {
             entries.join("\n")
         };
 
+        if entries.is_empty() {
+            return Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: output,
+                    text_signature: None,
+                }],
+                details: None,
+            });
+        }
+
+        let truncation = truncate_head(output.as_str(), Some((usize::MAX, DEFAULT_MAX_BYTES)));
+        let mut final_output = truncation.content.clone();
+        let mut notices = Vec::new();
+        let mut details = serde_json::Map::new();
+
+        if entry_limit_reached {
+            notices.push(format!(
+                "{effective_limit} entries limit reached. Use limit={} for more",
+                effective_limit * 2
+            ));
+            details.insert("entryLimitReached".to_string(), json!(effective_limit));
+        }
+
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details.insert("truncation".to_string(), json!(truncation));
+        }
+
+        if !notices.is_empty() {
+            final_output.push_str(&format!("\n\n[{}]", notices.join(". ")));
+        }
+
         Ok(ToolResult {
             content: vec![ContentBlock::Text {
-                text: output,
+                text: final_output,
                 text_signature: None,
             }],
-            details: None,
+            details: if details.is_empty() {
+                None
+            } else {
+                Some(Value::Object(details))
+            },
         })
     }
 }
@@ -757,6 +873,82 @@ fn truncate_line(line: &str, max_chars: usize) -> (String, bool) {
     }
 }
 
+enum GrepMatcher {
+    Literal { needle: String, ignore_case: bool },
+    Regex(regex::Regex),
+}
+
+impl GrepMatcher {
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            GrepMatcher::Literal {
+                needle,
+                ignore_case,
+            } => {
+                if *ignore_case {
+                    line.to_lowercase().contains(&needle.to_lowercase())
+                } else {
+                    line.contains(needle)
+                }
+            }
+            GrepMatcher::Regex(regex) => regex.is_match(line),
+        }
+    }
+}
+
+fn build_grep_matcher(
+    pattern: &str,
+    ignore_case: bool,
+    literal: bool,
+) -> Result<GrepMatcher, String> {
+    if literal {
+        return Ok(GrepMatcher::Literal {
+            needle: pattern.to_string(),
+            ignore_case,
+        });
+    }
+
+    let regex = RegexBuilder::new(pattern)
+        .case_insensitive(ignore_case)
+        .build()
+        .map_err(|err| format!("Invalid pattern: {err}"))?;
+    Ok(GrepMatcher::Regex(regex))
+}
+
+fn append_grep_block(
+    file_label: &str,
+    lines: &[&str],
+    line_number: usize,
+    context: usize,
+    matches_output: &mut Vec<String>,
+    lines_truncated: &mut bool,
+) {
+    let start = if context > 0 {
+        line_number.saturating_sub(context)
+    } else {
+        line_number
+    };
+    let end = if context > 0 {
+        (line_number + context).min(lines.len())
+    } else {
+        line_number
+    };
+
+    for current in start..=end {
+        let text_line = lines.get(current - 1).copied().unwrap_or("");
+        let sanitized = text_line.replace('\r', "");
+        let (trimmed, was_truncated) = truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
+        if was_truncated {
+            *lines_truncated = true;
+        }
+        if current == line_number {
+            matches_output.push(format!("{file_label}:{current}: {trimmed}"));
+        } else {
+            matches_output.push(format!("{file_label}-{current}- {trimmed}"));
+        }
+    }
+}
+
 fn normalize_to_lf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -862,6 +1054,45 @@ fn collect_files(
         if metadata.is_dir() {
             collect_files(base, &path, pattern, ignore_set, results);
         } else if metadata.is_file() && matches_pattern(&rel_string, pattern) {
+            results.push(rel_string);
+        }
+    }
+}
+
+fn collect_grep_files(
+    base: &Path,
+    current: &Path,
+    glob: Option<&str>,
+    ignore_set: &HashSet<String>,
+    results: &mut Vec<String>,
+) {
+    let entries = match fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let rel = path.strip_prefix(base).unwrap_or(&path);
+        let rel_string = rel.to_string_lossy().replace('\\', "/");
+        if rel_string.starts_with(".git/") {
+            continue;
+        }
+        if ignore_set.contains(rel_string.as_str()) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            collect_grep_files(base, &path, glob, ignore_set, results);
+        } else if metadata.is_file() {
+            if let Some(glob) = glob {
+                if !matches_pattern(&rel_string, glob) {
+                    continue;
+                }
+            }
             results.push(rel_string);
         }
     }
