@@ -74,7 +74,13 @@ impl EntryBuilder {
 }
 
 fn load_large_session_entries() -> Vec<SessionEntry> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let monorepo_root = manifest_dir.join("pi-mono");
+    let root = if monorepo_root.join("packages").exists() {
+        monorepo_root
+    } else {
+        manifest_dir.parent().unwrap_or(&manifest_dir).to_path_buf()
+    };
     let path = root.join("packages/coding-agent/test/fixtures/large-session.jsonl");
     let mut file_entries = load_entries_from_file(&path);
     migrate_session_entries(&mut file_entries);

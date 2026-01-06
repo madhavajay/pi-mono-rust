@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 // Source: packages/coding-agent/test/agent-session-compaction.test.ts
 
@@ -46,11 +46,8 @@ fn make_assistant_message(text: &str) -> AssistantMessage {
 
 fn create_temp_dir(prefix: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    dir.push(format!("{prefix}-{millis}-{}", std::process::id()));
+    let suffix = Uuid::new_v4();
+    dir.push(format!("{prefix}-{suffix}"));
     fs::create_dir_all(&dir).unwrap();
     dir
 }

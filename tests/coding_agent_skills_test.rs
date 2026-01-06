@@ -8,7 +8,12 @@ use std::path::PathBuf;
 // Source: packages/coding-agent/test/skills.test.ts
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let monorepo_root = manifest_dir.join("pi-mono");
+    if monorepo_root.join("packages").exists() {
+        return monorepo_root;
+    }
+    manifest_dir.parent().unwrap_or(&manifest_dir).to_path_buf()
 }
 
 fn fixtures_dir() -> PathBuf {

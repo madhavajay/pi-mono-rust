@@ -109,9 +109,22 @@ struct AnthropicCallOptions<'a> {
     system: Option<&'a str>,
 }
 
+struct OpenAICallOptions<'a> {
+    model: &'a str,
+    api_key: &'a str,
+    tools: &'a [OpenAITool],
+    base_url: &'a str,
+    extra_headers: Option<&'a HashMap<String, String>>,
+}
+
+struct FileInputImage {
+    mime_type: String,
+    data: String,
+}
+
 struct PrintModeOptions<'a> {
     tool_names: Option<&'a [String]>,
-    image_blocks: &'a [AnthropicContentBlock],
+    images: &'a [FileInputImage],
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
 }
@@ -388,6 +401,119 @@ struct AnthropicError {
     message: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct OpenAITool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct OpenAIRequest {
+    model: String,
+    input: Vec<OpenAIInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAIInputItem {
+    Message {
+        role: String,
+        content: Vec<OpenAIMessageContent>,
+    },
+    FunctionCall {
+        id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAIMessageContent {
+    InputText {
+        text: String,
+    },
+    OutputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponse {
+    output: Vec<OpenAIOutputItem>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAIOutputItem {
+    Message {
+        role: String,
+        content: Vec<OpenAIOutputContent>,
+    },
+    FunctionCall {
+        id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAIOutputContent {
+    OutputText {
+        text: String,
+    },
+    Refusal {
+        refusal: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAIContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIErrorResponse {
+    error: OpenAIError,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIError {
+    message: String,
+}
+
 fn build_anthropic_headers(
     api_key: &str,
     use_oauth: bool,
@@ -408,6 +534,26 @@ fn build_anthropic_headers(
             HeaderValue::from_str(api_key).map_err(|err| format!("Invalid API key: {err}"))?;
         headers.insert("x-api-key", value);
     }
+    if let Some(extra) = extra_headers {
+        for (key, value) in extra {
+            let header_name = HeaderName::from_bytes(key.as_bytes())
+                .map_err(|err| format!("Invalid header name \"{key}\": {err}"))?;
+            let header_value = HeaderValue::from_str(value)
+                .map_err(|err| format!("Invalid header value: {err}"))?;
+            headers.insert(header_name, header_value);
+        }
+    }
+    Ok(headers)
+}
+
+fn build_openai_headers(
+    api_key: &str,
+    extra_headers: Option<&HashMap<String, String>>,
+) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|err| format!("Invalid OpenAI API key: {err}"))?;
+    headers.insert("authorization", value);
     if let Some(extra) = extra_headers {
         for (key, value) in extra {
             let header_name = HeaderName::from_bytes(key.as_bytes())
@@ -486,11 +632,11 @@ fn build_model_registry(
     Ok(ModelRegistry::new(auth_storage, get_models_path()))
 }
 
-fn read_auth_json() -> Option<AuthCredential> {
+fn read_auth_credential(provider: &str) -> Option<AuthCredential> {
     let path = get_auth_path()?;
     let content = std::fs::read_to_string(path).ok()?;
     let data: AuthStorageData = serde_json::from_str(&content).ok()?;
-    data.get("anthropic").cloned()
+    data.get(provider).cloned()
 }
 
 fn resolve_anthropic_credentials(api_key_override: Option<&str>) -> Result<(String, bool), String> {
@@ -498,7 +644,7 @@ fn resolve_anthropic_credentials(api_key_override: Option<&str>) -> Result<(Stri
         return Ok((key.to_string(), false));
     }
 
-    if let Some(credential) = read_auth_json() {
+    if let Some(credential) = read_auth_credential("anthropic") {
         match credential {
             AuthCredential::ApiKey { key } => return Ok((key, false)),
             AuthCredential::OAuth { access, .. } => return Ok((access, true)),
@@ -517,6 +663,25 @@ fn resolve_anthropic_credentials(api_key_override: Option<&str>) -> Result<(Stri
         "Missing Anthropic credentials. Set ANTHROPIC_OAUTH_TOKEN or ANTHROPIC_API_KEY."
             .to_string(),
     )
+}
+
+fn resolve_openai_credentials(api_key_override: Option<&str>) -> Result<String, String> {
+    if let Some(key) = api_key_override {
+        return Ok(key.to_string());
+    }
+
+    if let Some(credential) = read_auth_credential("openai") {
+        match credential {
+            AuthCredential::ApiKey { key } => return Ok(key),
+            AuthCredential::OAuth { access, .. } => return Ok(access),
+        }
+    }
+
+    if let Some(key) = env_var_non_empty("OPENAI_API_KEY") {
+        return Ok(key);
+    }
+
+    Err("Missing OpenAI credentials. Set OPENAI_API_KEY.".to_string())
 }
 
 fn resolve_prompt_input(input: Option<&str>, description: &str) -> Option<String> {
@@ -575,7 +740,7 @@ fn resolve_file_arg(path: &str) -> PathBuf {
 
 struct FileInputs {
     text_prefix: String,
-    images: Vec<AnthropicContentBlock>,
+    images: Vec<FileInputImage>,
 }
 
 fn build_file_inputs(file_args: &[String]) -> Result<FileInputs, String> {
@@ -591,12 +756,9 @@ fn build_file_inputs(file_args: &[String]) -> Result<FileInputs, String> {
 
         if let Some(mime_type) = detect_image_mime_type(&data) {
             let encoded = base64_encode(&data);
-            images.push(AnthropicContentBlock::Image {
-                source: AnthropicImageSource {
-                    source_type: "base64".to_string(),
-                    media_type: mime_type.to_string(),
-                    data: encoded,
-                },
+            images.push(FileInputImage {
+                mime_type: mime_type.to_string(),
+                data: encoded,
             });
             text.push_str(&format!("<file name=\"{}\"></file>\n", path.display()));
             continue;
@@ -661,22 +823,48 @@ fn call_anthropic(
         .map_err(|err| format!("Failed to parse response: {err}"))
 }
 
-fn run_print_mode(
-    mode: Mode,
-    messages: &[String],
-    model: &RegistryModel,
-    api_key_override: Option<&str>,
-    options: PrintModeOptions<'_>,
-) -> Result<(), String> {
-    let prompt = messages.join("\n");
-    if prompt.trim().is_empty() && options.image_blocks.is_empty() {
-        return Err("No messages provided.".to_string());
+fn call_openai(
+    input: Vec<OpenAIInputItem>,
+    options: OpenAICallOptions<'_>,
+) -> Result<OpenAIResponse, String> {
+    let request = OpenAIRequest {
+        model: options.model.to_string(),
+        input,
+        tools: if options.tools.is_empty() {
+            None
+        } else {
+            Some(options.tools.to_vec())
+        },
+        stream: Some(false),
+    };
+
+    let headers = build_openai_headers(options.api_key, options.extra_headers)?;
+    let endpoint = format!("{}/responses", options.base_url.trim_end_matches('/'));
+    let client = Client::new();
+    let response = client
+        .post(endpoint)
+        .headers(headers)
+        .json(&request)
+        .send()
+        .map_err(|err| format!("Request failed: {err}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().unwrap_or_default();
+        if let Ok(error_response) = serde_json::from_str::<OpenAIErrorResponse>(&text) {
+            return Err(format!("OpenAI error: {}", error_response.error.message));
+        }
+        return Err(format!("OpenAI error: {} {}", status.as_u16(), text));
     }
 
-    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
+    response
+        .json::<OpenAIResponse>()
+        .map_err(|err| format!("Failed to parse response: {err}"))
+}
 
+fn build_tool_defs(tool_names: Option<&[String]>) -> Result<Vec<ToolDefinition>, String> {
     let mut tool_defs = default_tools();
-    if let Some(tool_names) = options.tool_names {
+    if let Some(tool_names) = tool_names {
         let missing = tool_names
             .iter()
             .filter(|name| !tool_defs.iter().any(|tool| tool.name == name.as_str()))
@@ -690,6 +878,155 @@ fn run_print_mode(
         }
         tool_defs.retain(|tool| tool_names.iter().any(|name| name == tool.name));
     }
+    Ok(tool_defs)
+}
+
+fn parse_openai_tool_arguments(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+}
+
+fn openai_output_to_content_blocks(output: &[OpenAIOutputItem]) -> Vec<OpenAIContentBlock> {
+    let mut blocks = Vec::new();
+    for item in output {
+        match item {
+            OpenAIOutputItem::Message { content, .. } => {
+                let mut text = String::new();
+                for part in content {
+                    match part {
+                        OpenAIOutputContent::OutputText { text: chunk } => text.push_str(chunk),
+                        OpenAIOutputContent::Refusal { refusal } => text.push_str(refusal),
+                        OpenAIOutputContent::Other => {}
+                    }
+                }
+                if !text.is_empty() {
+                    blocks.push(OpenAIContentBlock::Text { text });
+                }
+            }
+            OpenAIOutputItem::FunctionCall {
+                id,
+                call_id,
+                name,
+                arguments,
+            } => {
+                blocks.push(OpenAIContentBlock::ToolUse {
+                    id: format!("{call_id}|{id}"),
+                    name: name.clone(),
+                    input: parse_openai_tool_arguments(arguments),
+                });
+            }
+            OpenAIOutputItem::Other => {}
+        }
+    }
+    blocks
+}
+
+fn openai_output_to_input_items(output: &[OpenAIOutputItem]) -> Vec<OpenAIInputItem> {
+    let mut items = Vec::new();
+    for item in output {
+        match item {
+            OpenAIOutputItem::Message { role, content } => {
+                let mut converted = Vec::new();
+                for part in content {
+                    match part {
+                        OpenAIOutputContent::OutputText { text } => {
+                            converted.push(OpenAIMessageContent::OutputText { text: text.clone() });
+                        }
+                        OpenAIOutputContent::Refusal { refusal } => {
+                            converted.push(OpenAIMessageContent::OutputText {
+                                text: refusal.clone(),
+                            });
+                        }
+                        OpenAIOutputContent::Other => {}
+                    }
+                }
+                if !converted.is_empty() {
+                    items.push(OpenAIInputItem::Message {
+                        role: role.clone(),
+                        content: converted,
+                    });
+                }
+            }
+            OpenAIOutputItem::FunctionCall {
+                id,
+                call_id,
+                name,
+                arguments,
+            } => {
+                items.push(OpenAIInputItem::FunctionCall {
+                    id: id.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+            }
+            OpenAIOutputItem::Other => {}
+        }
+    }
+    items
+}
+
+struct OpenAIToolCall {
+    call_id: String,
+    name: String,
+    arguments: Value,
+}
+
+fn extract_openai_tool_calls(output: &[OpenAIOutputItem]) -> Vec<OpenAIToolCall> {
+    let mut calls = Vec::new();
+    for item in output {
+        if let OpenAIOutputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+            ..
+        } = item
+        {
+            calls.push(OpenAIToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: parse_openai_tool_arguments(arguments),
+            });
+        }
+    }
+    calls
+}
+
+fn run_print_mode(
+    mode: Mode,
+    messages: &[String],
+    model: &RegistryModel,
+    api_key_override: Option<&str>,
+    options: PrintModeOptions<'_>,
+) -> Result<(), String> {
+    match model.api.as_str() {
+        "anthropic-messages" => {
+            run_print_mode_anthropic(mode, messages, model, api_key_override, options)
+        }
+        "openai-responses" => {
+            run_print_mode_openai(mode, messages, model, api_key_override, options)
+        }
+        _ => Err(format!(
+            "Model API \"{}\" is not supported in print mode.",
+            model.api
+        )),
+    }
+}
+
+fn run_print_mode_anthropic(
+    mode: Mode,
+    messages: &[String],
+    model: &RegistryModel,
+    api_key_override: Option<&str>,
+    options: PrintModeOptions<'_>,
+) -> Result<(), String> {
+    let prompt = messages.join("\n");
+    if prompt.trim().is_empty() && options.images.is_empty() {
+        return Err("No messages provided.".to_string());
+    }
+
+    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
+
+    let tool_defs = build_tool_defs(options.tool_names)?;
     let tool_specs = tool_defs
         .iter()
         .map(|tool| AnthropicTool {
@@ -706,7 +1043,18 @@ fn run_print_mode(
     if !prompt.trim().is_empty() {
         initial_content.push(AnthropicContentBlock::Text { text: prompt });
     }
-    initial_content.extend(options.image_blocks.iter().cloned());
+    initial_content.extend(
+        options
+            .images
+            .iter()
+            .map(|image| AnthropicContentBlock::Image {
+                source: AnthropicImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: image.mime_type.clone(),
+                    data: image.data.clone(),
+                },
+            }),
+    );
 
     let mut system = options.system_prompt.or_else(|| {
         if use_oauth {
@@ -797,6 +1145,163 @@ fn run_print_mode(
     Ok(())
 }
 
+fn run_print_mode_openai(
+    mode: Mode,
+    messages: &[String],
+    model: &RegistryModel,
+    api_key_override: Option<&str>,
+    options: PrintModeOptions<'_>,
+) -> Result<(), String> {
+    let prompt = messages.join("\n");
+    if prompt.trim().is_empty() && options.images.is_empty() {
+        return Err("No messages provided.".to_string());
+    }
+
+    let api_key = resolve_openai_credentials(api_key_override)?;
+    let tool_defs = build_tool_defs(options.tool_names)?;
+    let tool_specs = tool_defs
+        .iter()
+        .map(|tool| OpenAITool {
+            tool_type: "function".to_string(),
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+            parameters: tool.input_schema.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let cwd = env::current_dir().map_err(|err| format!("Failed to read cwd: {err}"))?;
+    let tool_ctx = ToolContext { cwd };
+
+    let mut system = options.system_prompt;
+    if let Some(append) = options.append_system_prompt {
+        system = Some(match system {
+            Some(base) => format!("{base}\n\n{append}"),
+            None => append,
+        });
+    }
+
+    let mut conversation = Vec::new();
+    if let Some(system_text) = system {
+        let role = if model.reasoning {
+            "developer"
+        } else {
+            "system"
+        };
+        conversation.push(OpenAIInputItem::Message {
+            role: role.to_string(),
+            content: vec![OpenAIMessageContent::InputText { text: system_text }],
+        });
+    }
+
+    let mut user_content = Vec::new();
+    if !prompt.trim().is_empty() {
+        user_content.push(OpenAIMessageContent::InputText { text: prompt });
+    }
+    let supports_images = model.input.iter().any(|entry| entry == "image");
+    if supports_images {
+        for image in options.images {
+            user_content.push(OpenAIMessageContent::InputImage {
+                image_url: format!("data:{};base64,{}", image.mime_type, image.data),
+                detail: Some("auto".to_string()),
+            });
+        }
+    }
+    if user_content.is_empty() {
+        return Err("No messages provided.".to_string());
+    }
+    conversation.push(OpenAIInputItem::Message {
+        role: "user".to_string(),
+        content: user_content,
+    });
+
+    let mut last_response: Option<OpenAIResponse> = None;
+    for _ in 0..10 {
+        let response = call_openai(
+            conversation.clone(),
+            OpenAICallOptions {
+                model: &model.id,
+                api_key: &api_key,
+                tools: &tool_specs,
+                base_url: if model.base_url.is_empty() {
+                    "https://api.openai.com/v1"
+                } else {
+                    model.base_url.as_str()
+                },
+                extra_headers: model.headers.as_ref(),
+            },
+        )?;
+
+        let tool_calls = extract_openai_tool_calls(&response.output);
+        conversation.extend(openai_output_to_input_items(&response.output));
+
+        if tool_calls.is_empty() {
+            last_response = Some(response);
+            break;
+        }
+
+        let tool_results = tool_calls.into_iter().map(|call| {
+            let tool_use = ToolUse {
+                id: call.call_id.clone(),
+                name: call.name,
+                input: call.arguments,
+            };
+            let output = match execute_tool(&tool_use, &tool_defs, &tool_ctx) {
+                Ok(output) => output,
+                Err(message) => format!("Error: {message}"),
+            };
+            OpenAIInputItem::FunctionCallOutput {
+                call_id: call.call_id,
+                output,
+            }
+        });
+
+        conversation.extend(tool_results);
+    }
+
+    let response = last_response.ok_or_else(|| "Tool loop exceeded limit".to_string())?;
+    let content_blocks = openai_output_to_content_blocks(&response.output);
+    let has_tool_calls = content_blocks
+        .iter()
+        .any(|block| matches!(block, OpenAIContentBlock::ToolUse { .. }));
+    let stop_reason = match response.status.as_deref() {
+        Some("completed") | None => "stop",
+        Some("incomplete") => "length",
+        Some("failed") | Some("cancelled") => "error",
+        Some("queued") | Some("in_progress") => "stop",
+        Some(other) => {
+            return Err(format!("Unhandled OpenAI response status: {other}"));
+        }
+    };
+    let stop_reason = if has_tool_calls && stop_reason == "stop" {
+        "toolUse"
+    } else {
+        stop_reason
+    };
+
+    match mode {
+        Mode::Text => {
+            for block in &content_blocks {
+                if let OpenAIContentBlock::Text { text } = block {
+                    println!("{text}");
+                }
+            }
+        }
+        Mode::Json => {
+            let payload = json!({
+                "role": "assistant",
+                "content": content_blocks,
+                "stopReason": stop_reason,
+            });
+            println!("{payload}");
+        }
+        Mode::Rpc => {
+            return Err("RPC mode is not implemented yet.".to_string());
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct ToolUse {
     id: String,
@@ -823,27 +1328,29 @@ fn execute_tool_use(
     tools: &[ToolDefinition],
     ctx: &ToolContext,
 ) -> AnthropicContentBlock {
-    let tool = tools.iter().find(|tool| tool.name == tool_use.name);
-    match tool {
-        Some(tool) => match (tool.execute)(&tool_use.input, ctx) {
-            Ok(output) => AnthropicContentBlock::ToolResult {
-                tool_use_id: tool_use.id.clone(),
-                content: vec![AnthropicToolResultContent::Text { text: output }],
-                is_error: false,
-            },
-            Err(message) => AnthropicContentBlock::ToolResult {
-                tool_use_id: tool_use.id.clone(),
-                content: vec![AnthropicToolResultContent::Text { text: message }],
-                is_error: true,
-            },
-        },
-        None => AnthropicContentBlock::ToolResult {
+    match execute_tool(tool_use, tools, ctx) {
+        Ok(output) => AnthropicContentBlock::ToolResult {
             tool_use_id: tool_use.id.clone(),
-            content: vec![AnthropicToolResultContent::Text {
-                text: format!("Unknown tool: {}", tool_use.name),
-            }],
+            content: vec![AnthropicToolResultContent::Text { text: output }],
+            is_error: false,
+        },
+        Err(message) => AnthropicContentBlock::ToolResult {
+            tool_use_id: tool_use.id.clone(),
+            content: vec![AnthropicToolResultContent::Text { text: message }],
             is_error: true,
         },
+    }
+}
+
+fn execute_tool(
+    tool_use: &ToolUse,
+    tools: &[ToolDefinition],
+    ctx: &ToolContext,
+) -> Result<String, String> {
+    let tool = tools.iter().find(|tool| tool.name == tool_use.name);
+    match tool {
+        Some(tool) => (tool.execute)(&tool_use.input, ctx),
+        None => Err(format!("Unknown tool: {}", tool_use.name)),
     }
 }
 
@@ -895,8 +1402,10 @@ fn main() {
     let mode = parsed.mode.clone().unwrap_or(Mode::Text);
 
     let provider = parsed.provider.as_deref().unwrap_or("anthropic");
-    if provider != "anthropic" {
-        eprintln!("Error: unsupported provider \"{provider}\". Only \"anthropic\" is supported.");
+    if provider != "anthropic" && provider != "openai" {
+        eprintln!(
+            "Error: unsupported provider \"{provider}\". Only \"anthropic\" and \"openai\" are supported."
+        );
         process::exit(1);
     }
 
@@ -916,10 +1425,10 @@ fn main() {
         }
     };
 
-    if model.provider != "anthropic" {
+    if model.api != "anthropic-messages" && model.api != "openai-responses" {
         eprintln!(
-            "Error: unsupported provider \"{}\". Only \"anthropic\" is supported.",
-            model.provider
+            "Error: unsupported model API \"{}\". Only \"anthropic-messages\" and \"openai-responses\" are supported.",
+            model.api
         );
         process::exit(1);
     }
@@ -938,6 +1447,10 @@ fn main() {
     if matches!(mode, Mode::Rpc) {
         if !parsed.file_args.is_empty() {
             eprintln!("Error: @file arguments are not supported in RPC mode.");
+            process::exit(1);
+        }
+        if model.api != "anthropic-messages" {
+            eprintln!("Error: RPC mode currently supports only \"anthropic-messages\" models.");
             process::exit(1);
         }
         let session = match create_rpc_session(
@@ -962,7 +1475,7 @@ fn main() {
     }
 
     let mut messages = parsed.messages.clone();
-    let mut image_blocks = Vec::new();
+    let mut images = Vec::new();
     if !parsed.file_args.is_empty() {
         let inputs = match build_file_inputs(&parsed.file_args) {
             Ok(inputs) => inputs,
@@ -978,7 +1491,7 @@ fn main() {
                 messages[0] = format!("{}{}", inputs.text_prefix, messages[0]);
             }
         }
-        image_blocks = inputs.images;
+        images = inputs.images;
     }
 
     if let Err(message) = run_print_mode(
@@ -988,7 +1501,7 @@ fn main() {
         parsed.api_key.as_deref(),
         PrintModeOptions {
             tool_names: parsed.tools.as_deref(),
-            image_blocks: &image_blocks,
+            images: &images,
             system_prompt,
             append_system_prompt,
         },

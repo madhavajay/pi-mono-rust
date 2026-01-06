@@ -122,7 +122,7 @@ Planned modules (initial, not final):
 ## Current Rust Status (Implemented)
 - Session manager + compaction logic with ported tests (deterministic only).
 - CLI arg parsing parity tests.
-- Print mode wired to Anthropic Messages API (non-streaming).
+- Print mode wired to Anthropic Messages API and OpenAI Responses API (non-streaming).
 - Auth reuse via `~/.pi/agent/auth.json` or `PI_CODING_AGENT_DIR` fallback.
 - Minimal tool calling loop in print mode with built-in `read`, `write`, `edit`, `bash`.
 
