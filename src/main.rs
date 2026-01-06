@@ -5,8 +5,8 @@ use pi::agent::{
 use pi::cli::list_models::list_models;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
-    AgentSession, AgentSessionConfig, AuthCredential, AuthStorage, Model as RegistryModel,
-    ModelRegistry, SettingsManager,
+    build_system_prompt, AgentSession, AgentSessionConfig, AuthCredential, AuthStorage,
+    BuildSystemPromptOptions, Model as RegistryModel, ModelRegistry, SettingsManager,
 };
 use pi::core::messages::{
     AgentMessage as CoreAgentMessage, AssistantMessage, ContentBlock, Cost, ToolResultMessage,
@@ -50,11 +50,13 @@ Options:
   --print, -p      Print mode (single-shot)
   --list-models    List available models
   --mode <mode>    Output mode: text (default), json, rpc
+  --no-skills      Disable skills discovery and loading
+  --skills         Comma-separated glob patterns to filter skills
   @file            Include file contents in prompt (text or images)
 
 Notes:
   Interactive mode is not implemented yet.
-  --resume, --hook, --tool, --export, --no-skills, --skills are not implemented yet."
+  --resume, --hook, --tool, --export are not implemented yet."
     );
 }
 
@@ -75,12 +77,6 @@ fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
     }
     if parsed.export.is_some() {
         unsupported.push("--export");
-    }
-    if parsed.no_skills {
-        unsupported.push("--no-skills");
-    }
-    if parsed.skills.is_some() {
-        unsupported.push("--skills");
     }
     unsupported
 }
@@ -664,28 +660,6 @@ fn resolve_openai_credentials(api_key_override: Option<&str>) -> Result<String, 
     }
 
     Err("Missing OpenAI credentials. Set OPENAI_API_KEY.".to_string())
-}
-
-fn resolve_prompt_input(input: Option<&str>, description: &str) -> Option<String> {
-    let input = input?;
-    if input.trim().is_empty() {
-        return None;
-    }
-    let path = PathBuf::from(input);
-    if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => Some(content),
-            Err(err) => {
-                eprintln!(
-                    "Warning: Could not read {} file {}: {}",
-                    description, input, err
-                );
-                Some(input.to_string())
-            }
-        }
-    } else {
-        Some(input.to_string())
-    }
 }
 
 fn discover_system_prompt_file() -> Option<PathBuf> {
@@ -1301,17 +1275,6 @@ fn main() {
         process::exit(1);
     }
 
-    let system_prompt_source = if parsed.system_prompt.is_some() {
-        parsed.system_prompt.clone()
-    } else {
-        discover_system_prompt_file().map(|path| path.to_string_lossy().to_string())
-    };
-    let system_prompt = resolve_prompt_input(system_prompt_source.as_deref(), "system prompt");
-    let append_system_prompt = resolve_prompt_input(
-        parsed.append_system_prompt.as_deref(),
-        "append system prompt",
-    );
-
     let cwd = match env::current_dir() {
         Ok(cwd) => cwd,
         Err(err) => {
@@ -1319,6 +1282,28 @@ fn main() {
             process::exit(1);
         }
     };
+    let system_prompt_source = if parsed.system_prompt.is_some() {
+        parsed.system_prompt.clone()
+    } else {
+        discover_system_prompt_file().map(|path| path.to_string_lossy().to_string())
+    };
+    let skill_patterns = parsed.skills.clone().unwrap_or_default();
+    let prompt_tools = parsed.tools.clone().unwrap_or_else(|| {
+        default_tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    });
+    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
+        custom_prompt: system_prompt_source,
+        append_system_prompt: parsed.append_system_prompt.clone(),
+        selected_tools: Some(prompt_tools),
+        skills_enabled: !parsed.no_skills,
+        skills_include: skill_patterns,
+        cwd: Some(cwd.clone()),
+        agent_dir: get_agent_dir(),
+        ..Default::default()
+    });
     let session_manager = build_session_manager(&parsed, &cwd);
 
     if matches!(mode, Mode::Rpc) {
@@ -1333,8 +1318,8 @@ fn main() {
         let session = match create_rpc_session(
             model,
             registry,
-            system_prompt,
-            append_system_prompt,
+            Some(system_prompt),
+            None,
             parsed.tools.as_deref(),
             parsed.api_key.as_deref(),
             session_manager,
@@ -1379,8 +1364,8 @@ fn main() {
     let mut session = match create_cli_session(
         model,
         registry,
-        system_prompt,
-        append_system_prompt,
+        Some(system_prompt),
+        None,
         parsed.tools.as_deref(),
         parsed.api_key.as_deref(),
         session_manager,

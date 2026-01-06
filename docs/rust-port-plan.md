@@ -129,6 +129,7 @@ Planned modules (initial, not final):
 - Print mode now uses `AgentSession` with session persistence (`--continue`, `--session`, `--session-dir`, `--no-session`).
 - Session default directory respects `PI_CODING_AGENT_DIR` for `sessions/`.
 - Bash tool now truncates tail output with temp file preservation when output exceeds limits.
+- System prompt builder now mirrors TS defaults (tools/guidelines, project context files, skills; `--skills`/`--no-skills`).
 
 ## Test Plan
 ### Baseline (TS)
