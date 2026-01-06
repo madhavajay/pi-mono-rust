@@ -1,3 +1,5 @@
+pub mod openai_codex;
+
 use crate::agent::{AgentMessage, LlmContext, StreamEvents};
 use crate::ai::AssistantMessageEvent;
 use crate::coding_agent::Model as RegistryModel;
@@ -294,7 +296,10 @@ fn build_openai_headers(
     Ok(headers)
 }
 
-fn build_system_content(system: Option<&str>, use_oauth: bool) -> Option<Vec<AnthropicSystemContent>> {
+fn build_system_content(
+    system: Option<&str>,
+    use_oauth: bool,
+) -> Option<Vec<AnthropicSystemContent>> {
     if use_oauth {
         // For OAuth tokens, Claude Code identification MUST be the first separate element
         let claude_code_id = AnthropicSystemContent {

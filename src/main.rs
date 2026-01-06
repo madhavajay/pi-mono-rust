@@ -91,9 +91,9 @@ fn main() {
     let mode = parsed.mode.clone().unwrap_or(Mode::Text);
 
     let provider = parsed.provider.as_deref().unwrap_or("anthropic");
-    if provider != "anthropic" && provider != "openai" {
+    if provider != "anthropic" && provider != "openai" && provider != "openai-codex" {
         eprintln!(
-            "Error: unsupported provider \"{provider}\". Only \"anthropic\" and \"openai\" are supported."
+            "Error: unsupported provider \"{provider}\". Only \"anthropic\", \"openai\", and \"openai-codex\" are supported."
         );
         process::exit(1);
     }
@@ -114,9 +114,12 @@ fn main() {
         }
     };
 
-    if model.api != "anthropic-messages" && model.api != "openai-responses" {
+    if model.api != "anthropic-messages"
+        && model.api != "openai-responses"
+        && model.api != "openai-codex-responses"
+    {
         eprintln!(
-            "Error: unsupported model API \"{}\". Only \"anthropic-messages\" and \"openai-responses\" are supported.",
+            "Error: unsupported model API \"{}\". Only \"anthropic-messages\", \"openai-responses\", and \"openai-codex-responses\" are supported.",
             model.api
         );
         process::exit(1);

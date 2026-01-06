@@ -2,6 +2,7 @@ use crate::agent::{
     Agent, AgentOptions, AgentStateOverride, AgentTool, AgentToolResult, LlmContext,
     Model as AgentModel, ThinkingLevel,
 };
+use crate::api::openai_codex::{stream_openai_codex_responses, CodexStreamOptions, CodexTool};
 use crate::api::{
     assistant_error_message, build_anthropic_messages, openai_context_to_input_items,
     AnthropicCallOptions, AnthropicTool, OpenAICallOptions, OpenAITool,
@@ -410,7 +411,10 @@ fn build_stream_fn(
             if context.system_prompt.trim().is_empty() {
                 DEFAULT_OAUTH_SYSTEM_PROMPT.to_string()
             } else {
-                format!("{}\n\n{}", DEFAULT_OAUTH_SYSTEM_PROMPT, context.system_prompt)
+                format!(
+                    "{}\n\n{}",
+                    DEFAULT_OAUTH_SYSTEM_PROMPT, context.system_prompt
+                )
             }
         } else {
             context.system_prompt.clone()
@@ -479,6 +483,32 @@ fn build_openai_stream_fn(
     })
 }
 
+fn build_codex_stream_fn(
+    model: RegistryModel,
+    api_key: String,
+    tool_specs: Vec<CodexTool>,
+) -> AgentStreamFn {
+    Box::new(move |_agent_model, context, events| {
+        let response = stream_openai_codex_responses(
+            &model,
+            context,
+            &api_key,
+            &tool_specs,
+            CodexStreamOptions {
+                codex_mode: Some(true),
+                extra_headers: model.headers.clone(),
+                ..Default::default()
+            },
+            events,
+        );
+
+        match response {
+            Ok(response) => response,
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
 fn merge_system_prompt(
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
@@ -535,6 +565,20 @@ pub fn create_cli_session(
                 })
                 .collect::<Vec<_>>();
             build_openai_stream_fn(model.clone(), api_key, tool_specs)
+        }
+        "openai-codex-responses" => {
+            let api_key = crate::cli::auth::resolve_openai_codex_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| CodexTool {
+                    tool_type: "function".to_string(),
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
+                    strict: None,
+                })
+                .collect::<Vec<_>>();
+            build_codex_stream_fn(model.clone(), api_key, tool_specs)
         }
         _ => {
             return Err(format!(
@@ -614,6 +658,20 @@ pub fn create_rpc_session(
                 })
                 .collect::<Vec<_>>();
             build_openai_stream_fn(model.clone(), api_key, tool_specs)
+        }
+        "openai-codex-responses" => {
+            let api_key = crate::cli::auth::resolve_openai_codex_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| CodexTool {
+                    tool_type: "function".to_string(),
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
+                    strict: None,
+                })
+                .collect::<Vec<_>>();
+            build_codex_stream_fn(model.clone(), api_key, tool_specs)
         }
         _ => {
             return Err(format!(

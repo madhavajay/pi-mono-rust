@@ -162,9 +162,16 @@ Planned modules (initial, not final):
 - Interactive mode now supports `/model`, `/settings`, `/changelog`, and `/hotkeys` in the basic TUI (line-based flow).
 - CLI refactor: extracted RPC handlers, API wrappers, and mode runners into dedicated modules; main.rs is now slim.
 - Streaming now uses SSE parsing for Anthropic/OpenAI Responses and emits incremental agent events.
+- **OpenAI Codex provider parity** - Full streaming support for Codex API (`openai-codex-responses`):
+  - Constants module with Codex-specific headers and URLs.
+  - Request transformer: model normalization, reasoning effort/summary config, text verbosity, encrypted content handling, prompt cache keys.
+  - Response handler: Codex-specific error parsing (rate limits, auth errors, SSE parsing).
+  - Prompts module: Codex instructions fetching from GitHub with ETag caching, pi-codex-bridge injection.
+  - Stream module: JWT decoding for account ID, SSE parsing, event emission for reasoning/text/tool calls.
+  - Integration with session.rs for `openai-codex-responses` API type.
+  - Auth module extended with `resolve_openai_codex_credentials` for separate Codex OAuth tokens.
 
 ## Remaining Gaps (Next)
-- OpenAI Codex provider support (request transformer, prompt cache with etag fallback, error parsing, codex responses streaming) + tests.
 - Interactive TUI parity: inline images (Kitty/iTerm2), selectors/keybindings, tool output expansion, session tree UX, theme reload.
 - TS extensions support in the JS host (jiti-based loading) + parity tests.
 
