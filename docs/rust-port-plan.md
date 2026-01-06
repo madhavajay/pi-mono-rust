@@ -162,6 +162,10 @@ Planned modules (initial, not final):
 - Interactive mode now supports `/model`, `/settings`, `/changelog`, and `/hotkeys` in the basic TUI (line-based flow).
 - CLI refactor: extracted RPC handlers, API wrappers, and mode runners into dedicated modules; main.rs is now slim.
 - Streaming now uses SSE parsing for Anthropic/OpenAI Responses and emits incremental agent events.
+- **Usage statistics extraction** - Full parity with TS for token counting and cost calculation:
+  - Anthropic streams: Extracts `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` from `message_start` and `message_delta` events.
+  - OpenAI Responses streams: Extracts usage from `response.completed` event including `cached_tokens` from `input_tokens_details`.
+  - Cost calculation: Computes costs using model pricing (per-million rates) and updates `usage.cost` with input/output/cacheRead/cacheWrite/total.
 - **OpenAI Codex provider parity** - Full streaming support for Codex API (`openai-codex-responses`):
   - Constants module with Codex-specific headers and URLs.
   - Request transformer: model normalization, reasoning effort/summary config, text verbosity, encrypted content handling, prompt cache keys.

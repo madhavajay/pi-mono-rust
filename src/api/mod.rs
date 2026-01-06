@@ -594,7 +594,20 @@ pub fn stream_anthropic(
                 Err(_) => continue,
             };
             match event_name.as_str() {
-                "message_start" => {}
+                "message_start" => {
+                    // Extract initial usage from message_start event
+                    if let Some((input, output, cache_read, cache_write)) =
+                        extract_anthropic_usage(&value, "message")
+                    {
+                        partial.usage.input = input;
+                        partial.usage.output = output;
+                        partial.usage.cache_read = cache_read;
+                        partial.usage.cache_write = cache_write;
+                        partial.usage.total_tokens =
+                            Some(input + output + cache_read + cache_write);
+                        calculate_cost(model, &mut partial.usage);
+                    }
+                }
                 "message_delta" => {
                     if let Some(reason) = value
                         .get("delta")
@@ -602,6 +615,18 @@ pub fn stream_anthropic(
                         .and_then(Value::as_str)
                     {
                         partial.stop_reason = map_anthropic_stop_reason(reason);
+                    }
+                    // Extract final usage from message_delta event
+                    if let Some((input, output, cache_read, cache_write)) =
+                        extract_anthropic_usage(&value, "")
+                    {
+                        partial.usage.input = input;
+                        partial.usage.output = output;
+                        partial.usage.cache_read = cache_read;
+                        partial.usage.cache_write = cache_write;
+                        partial.usage.total_tokens =
+                            Some(input + output + cache_read + cache_write);
+                        calculate_cost(model, &mut partial.usage);
                     }
                 }
                 "content_block_start" => {
@@ -1045,18 +1070,39 @@ pub fn stream_openai_responses(
                     }
                 }
                 "response.completed" => {
-                    if let Some(status) = value
-                        .get("response")
-                        .and_then(|response| response.get("status"))
-                        .and_then(Value::as_str)
-                    {
-                        let mapped = match status {
-                            "completed" => "stop",
-                            "incomplete" => "length",
-                            "failed" | "cancelled" => "error",
-                            _ => "stop",
-                        };
-                        stop_reason = Some(mapped.to_string());
+                    if let Some(response_obj) = value.get("response") {
+                        // Extract status
+                        if let Some(status) = response_obj.get("status").and_then(Value::as_str) {
+                            let mapped = match status {
+                                "completed" => "stop",
+                                "incomplete" => "length",
+                                "failed" | "cancelled" => "error",
+                                _ => "stop",
+                            };
+                            stop_reason = Some(mapped.to_string());
+                        }
+                        // Extract usage information
+                        if let Some(usage) = response_obj.get("usage") {
+                            let cached_tokens = usage
+                                .get("input_tokens_details")
+                                .and_then(|d| d.get("cached_tokens"))
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            let input_tokens = usage
+                                .get("input_tokens")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            let output_tokens = usage
+                                .get("output_tokens")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            partial.usage.input = input_tokens;
+                            partial.usage.output = output_tokens;
+                            partial.usage.cache_read = cached_tokens;
+                            partial.usage.total_tokens =
+                                Some(input_tokens + output_tokens + cached_tokens);
+                            calculate_cost(model, &mut partial.usage);
+                        }
                     }
                 }
                 "response.error" => {
@@ -1262,6 +1308,43 @@ fn empty_usage() -> Usage {
             total: 0.0,
         }),
     }
+}
+
+fn calculate_cost(model: &RegistryModel, usage: &mut Usage) {
+    let cost = Cost {
+        input: (model.cost.input / 1_000_000.0) * usage.input as f64,
+        output: (model.cost.output / 1_000_000.0) * usage.output as f64,
+        cache_read: (model.cost.cache_read / 1_000_000.0) * usage.cache_read as f64,
+        cache_write: (model.cost.cache_write / 1_000_000.0) * usage.cache_write as f64,
+        total: 0.0,
+    };
+    let total = cost.input + cost.output + cost.cache_read + cost.cache_write;
+    usage.cost = Some(Cost { total, ..cost });
+}
+
+fn extract_anthropic_usage(value: &Value, usage_path: &str) -> Option<(i64, i64, i64, i64)> {
+    let usage_obj = if usage_path.is_empty() {
+        value.get("usage")
+    } else {
+        value.get(usage_path).and_then(|v| v.get("usage"))
+    }?;
+    let input = usage_obj
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output = usage_obj
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_read = usage_obj
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_write = usage_obj
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Some((input, output, cache_read, cache_write))
 }
 
 fn now_millis() -> i64 {
