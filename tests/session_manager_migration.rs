@@ -52,7 +52,7 @@ fn adds_id_and_parent_id_to_v1_entries() {
         FileEntry::Session(header) => header,
         _ => panic!("expected session header"),
     };
-    assert_eq!(header.version, Some(2));
+    assert_eq!(header.version, Some(3));
 
     let msg1 = match &entries[1] {
         FileEntry::Message(message) => message,
@@ -77,7 +77,7 @@ fn migration_is_idempotent() {
     let mut entries = vec![
         FileEntry::Session(SessionHeader {
             id: "sess-1".to_string(),
-            version: Some(2),
+            version: Some(3),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             cwd: "/tmp".to_string(),
             parent_session: None,
@@ -132,4 +132,34 @@ fn migration_is_idempotent() {
     assert_eq!(msg1.id, "abc12345");
     assert_eq!(msg2.id, "def67890");
     assert_eq!(msg2.parent_id.as_deref(), Some("abc12345"));
+}
+
+#[test]
+fn migrates_v2_header_to_v3() {
+    let mut entries = vec![
+        FileEntry::Session(SessionHeader {
+            id: "sess-1".to_string(),
+            version: Some(2),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            cwd: "/tmp".to_string(),
+            parent_session: None,
+        }),
+        FileEntry::Message(SessionMessageEntry {
+            id: "abc12345".to_string(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:01Z".to_string(),
+            message: pi::AgentMessage::User(pi::UserMessage {
+                content: pi::UserContent::Text("hi".to_string()),
+                timestamp: 1,
+            }),
+        }),
+    ];
+
+    migrate_session_entries(&mut entries);
+
+    let header = match &entries[0] {
+        FileEntry::Session(header) => header,
+        _ => panic!("expected session header"),
+    };
+    assert_eq!(header.version, Some(3));
 }

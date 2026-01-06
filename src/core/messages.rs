@@ -140,6 +140,7 @@ pub enum AgentMessage {
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
     BashExecution(BashExecutionMessage),
+    #[serde(rename = "custom", alias = "hookMessage")]
     HookMessage(HookMessage),
     BranchSummary(BranchSummaryMessage),
     CompactionSummary(CompactionSummaryMessage),

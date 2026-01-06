@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use uuid::Uuid;
 
-pub const CURRENT_SESSION_VERSION: i64 = 2;
+pub const CURRENT_SESSION_VERSION: i64 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -403,7 +403,13 @@ pub fn migrate_session_entries(entries: &mut [FileEntry]) {
         return;
     }
 
-    migrate_v1_to_v2(entries);
+    let version = header_version.unwrap_or(1);
+    if version < 2 {
+        migrate_v1_to_v2(entries);
+    }
+    if version < 3 {
+        migrate_v2_to_v3(entries);
+    }
 }
 
 fn migrate_v1_to_v2(entries: &mut [FileEntry]) {
@@ -492,6 +498,14 @@ fn migrate_v1_to_v2(entries: &mut [FileEntry]) {
                 }
             }
             compaction.first_kept_entry_index = None;
+        }
+    }
+}
+
+fn migrate_v2_to_v3(entries: &mut [FileEntry]) {
+    for entry in entries.iter_mut() {
+        if let FileEntry::Session(header) = entry {
+            header.version = Some(CURRENT_SESSION_VERSION);
         }
     }
 }

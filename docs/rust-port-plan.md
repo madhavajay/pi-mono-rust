@@ -121,6 +121,7 @@ Planned modules (initial, not final):
 
 ## Current Rust Status (Implemented)
 - Session manager + compaction logic with ported tests (deterministic only).
+- Session migration now matches TS v3 (hookMessage -> custom) and writes version 3 headers.
 - CLI arg parsing parity tests.
 - Print mode wired to Anthropic Messages API and OpenAI Responses API (non-streaming).
 - Auth reuse via `~/.pi/agent/auth.json` or `PI_CODING_AGENT_DIR` fallback.
