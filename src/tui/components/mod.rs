@@ -1,17 +1,21 @@
 mod component;
 mod container;
 mod editor;
+mod expandable;
 mod image;
 mod markdown;
 mod spacer;
 mod text;
+mod tree_selector;
 mod truncated_text;
 
 pub use component::Component;
 pub use container::Container;
 pub use editor::{Editor, EditorTheme};
+pub use expandable::{Expandable, ExpandableText, ToolPreviewConfig};
 pub use image::{Image, ImageOptions, ImageTheme};
 pub use markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 pub use spacer::Spacer;
 pub use text::Text;
+pub use tree_selector::{FilterMode, TreeList, TreeSelectorComponent};
 pub use truncated_text::TruncatedText;

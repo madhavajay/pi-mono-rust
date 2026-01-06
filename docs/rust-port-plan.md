@@ -180,9 +180,29 @@ Planned modules (initial, not final):
   - Image component: TUI component with fallback text for unsupported terminals.
   - **Tests ported from TS**: `tests/tui_terminal_image_test.rs` covers Kitty/iTerm2 encoding, dimension parsing for all formats, row calculation, and fallback text (matching `image-test.ts`).
   - Interactive mode wired to render images inline when `show-images` setting is true and terminal supports images.
+- **Interactive TUI keybindings system**:
+  - `tui/keys.rs`: Full keyboard input handling for legacy terminal sequences and Kitty keyboard protocol.
+  - Support for modifier keys (ctrl, shift, alt, and combinations).
+  - Arrow keys, functional keys (Home/End/Delete/Insert/PageUp/PageDown).
+  - `matches_key()` for key matching, `parse_key()` for key identification.
+  - Global Kitty protocol state tracking for mode-aware sequence handling.
+  - Unit tests covering legacy sequences, Kitty CSI u format, and modifier combinations.
+- **Expandable text component for tool outputs**:
+  - `tui/components/expandable.rs`: Expandable trait and ExpandableText component.
+  - Collapse/expand support with configurable preview lines.
+  - ToolPreviewConfig for per-tool preview line limits.
+  - Unit tests for truncation, expansion, and rendering.
+- **Session tree selector component**:
+  - `tui/components/tree_selector.rs`: Full session tree navigation with ASCII art visualization.
+  - Tree flattening with active path tracking and gutter rendering (├─, └─, │ connectors).
+  - Filter modes (default, no-tools, user-only, labeled-only, all) with cycling via Ctrl+O.
+  - Search/filtering by text with real-time updates.
+  - Keyboard navigation (up/down, page up/down with left/right).
+  - Label editing support (press 'l' to edit).
+  - TreeSelectorComponent wrapper with header and search UI.
 
 ## Remaining Gaps (Next)
-- Interactive TUI parity: selectors/keybindings, tool output expansion, session tree UX, theme reload.
+- Interactive TUI parity: session selector (for resuming sessions), theme reload with file watcher, input component improvements.
 - TS extensions support in the JS host (jiti-based loading) + parity tests.
 
 ## Test Plan
