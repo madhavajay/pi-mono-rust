@@ -2,6 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT"
+cd "$ROOT/pi-mono"
 
 npx tsx packages/coding-agent/src/cli.ts "$@"

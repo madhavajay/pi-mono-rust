@@ -47,7 +47,7 @@ run_ts_tests() (
     npm test
 )
 
-cargo test --manifest-path "$ROOT/rust/Cargo.toml"
+cargo test --manifest-path "$ROOT/Cargo.toml"
 
 if [[ "${RUN_TS_TESTS:-}" == "1" ]]; then
     run_ts_tests
