@@ -9,8 +9,12 @@ use crate::core::messages::{
     AgentMessage as CoreAgentMessage, BashExecutionMessage, ContentBlock, UserContent, UserMessage,
 };
 use crate::core::session_manager::{BranchSummaryEntry, SessionEntry, SessionManager};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::cell::{Cell, RefCell};
+use std::env;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
@@ -770,51 +774,633 @@ impl std::fmt::Display for AgentSessionError {
 
 impl std::error::Error for AgentSessionError {}
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsCompaction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_recent_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsBranchSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsRetry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_delay_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsSkills {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_codex_user: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_claude_user: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_claude_project: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_pi_user: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_pi_project: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_directories: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored_skills: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_skills: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsTerminal {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_images: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsImages {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_resize: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_changelog_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_thinking_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steering_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<SettingsCompaction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_summary: Option<SettingsBranchSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<SettingsRetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hide_thinking_block: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collapse_changelog: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<SettingsSkills>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<SettingsTerminal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<SettingsImages>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_models: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub double_escape_action: Option<String>,
+}
+
+fn merge_settings(base: &Settings, overrides: &Settings) -> Settings {
+    Settings {
+        last_changelog_version: overrides
+            .last_changelog_version
+            .clone()
+            .or_else(|| base.last_changelog_version.clone()),
+        default_provider: overrides
+            .default_provider
+            .clone()
+            .or_else(|| base.default_provider.clone()),
+        default_model: overrides
+            .default_model
+            .clone()
+            .or_else(|| base.default_model.clone()),
+        default_thinking_level: overrides
+            .default_thinking_level
+            .clone()
+            .or_else(|| base.default_thinking_level.clone()),
+        steering_mode: overrides
+            .steering_mode
+            .clone()
+            .or_else(|| base.steering_mode.clone()),
+        follow_up_mode: overrides
+            .follow_up_mode
+            .clone()
+            .or_else(|| base.follow_up_mode.clone()),
+        theme: overrides.theme.clone().or_else(|| base.theme.clone()),
+        compaction: merge_optional_nested(
+            base.compaction.as_ref(),
+            overrides.compaction.as_ref(),
+            merge_compaction,
+        ),
+        branch_summary: merge_optional_nested(
+            base.branch_summary.as_ref(),
+            overrides.branch_summary.as_ref(),
+            merge_branch_summary,
+        ),
+        retry: merge_optional_nested(base.retry.as_ref(), overrides.retry.as_ref(), merge_retry),
+        hide_thinking_block: overrides.hide_thinking_block.or(base.hide_thinking_block),
+        shell_path: overrides
+            .shell_path
+            .clone()
+            .or_else(|| base.shell_path.clone()),
+        collapse_changelog: overrides.collapse_changelog.or(base.collapse_changelog),
+        extensions: overrides
+            .extensions
+            .clone()
+            .or_else(|| base.extensions.clone()),
+        skills: merge_optional_nested(
+            base.skills.as_ref(),
+            overrides.skills.as_ref(),
+            merge_skills,
+        ),
+        terminal: merge_optional_nested(
+            base.terminal.as_ref(),
+            overrides.terminal.as_ref(),
+            merge_terminal,
+        ),
+        images: merge_optional_nested(
+            base.images.as_ref(),
+            overrides.images.as_ref(),
+            merge_images,
+        ),
+        enabled_models: overrides
+            .enabled_models
+            .clone()
+            .or_else(|| base.enabled_models.clone()),
+        double_escape_action: overrides
+            .double_escape_action
+            .clone()
+            .or_else(|| base.double_escape_action.clone()),
+    }
+}
+
+fn merge_optional_nested<T, F>(base: Option<&T>, overrides: Option<&T>, merge: F) -> Option<T>
+where
+    T: Clone,
+    F: Fn(&T, &T) -> T,
+{
+    match (base, overrides) {
+        (Some(base), Some(overrides)) => Some(merge(base, overrides)),
+        (None, Some(overrides)) => Some(overrides.clone()),
+        (Some(base), None) => Some(base.clone()),
+        (None, None) => None,
+    }
+}
+
+fn merge_compaction(
+    base: &SettingsCompaction,
+    overrides: &SettingsCompaction,
+) -> SettingsCompaction {
+    SettingsCompaction {
+        enabled: overrides.enabled.or(base.enabled),
+        reserve_tokens: overrides.reserve_tokens.or(base.reserve_tokens),
+        keep_recent_tokens: overrides.keep_recent_tokens.or(base.keep_recent_tokens),
+    }
+}
+
+fn merge_branch_summary(
+    base: &SettingsBranchSummary,
+    overrides: &SettingsBranchSummary,
+) -> SettingsBranchSummary {
+    SettingsBranchSummary {
+        reserve_tokens: overrides.reserve_tokens.or(base.reserve_tokens),
+    }
+}
+
+fn merge_retry(base: &SettingsRetry, overrides: &SettingsRetry) -> SettingsRetry {
+    SettingsRetry {
+        enabled: overrides.enabled.or(base.enabled),
+        max_retries: overrides.max_retries.or(base.max_retries),
+        base_delay_ms: overrides.base_delay_ms.or(base.base_delay_ms),
+    }
+}
+
+fn merge_skills(base: &SettingsSkills, overrides: &SettingsSkills) -> SettingsSkills {
+    SettingsSkills {
+        enabled: overrides.enabled.or(base.enabled),
+        enable_codex_user: overrides.enable_codex_user.or(base.enable_codex_user),
+        enable_claude_user: overrides.enable_claude_user.or(base.enable_claude_user),
+        enable_claude_project: overrides
+            .enable_claude_project
+            .or(base.enable_claude_project),
+        enable_pi_user: overrides.enable_pi_user.or(base.enable_pi_user),
+        enable_pi_project: overrides.enable_pi_project.or(base.enable_pi_project),
+        custom_directories: overrides
+            .custom_directories
+            .clone()
+            .or_else(|| base.custom_directories.clone()),
+        ignored_skills: overrides
+            .ignored_skills
+            .clone()
+            .or_else(|| base.ignored_skills.clone()),
+        include_skills: overrides
+            .include_skills
+            .clone()
+            .or_else(|| base.include_skills.clone()),
+    }
+}
+
+fn merge_terminal(base: &SettingsTerminal, overrides: &SettingsTerminal) -> SettingsTerminal {
+    SettingsTerminal {
+        show_images: overrides.show_images.or(base.show_images),
+    }
+}
+
+fn merge_images(base: &SettingsImages, overrides: &SettingsImages) -> SettingsImages {
+    SettingsImages {
+        auto_resize: overrides.auto_resize.or(base.auto_resize),
+    }
+}
+
 pub struct SettingsManager {
-    compaction_settings: crate::core::compaction::CompactionSettings,
-    auto_retry_enabled: bool,
+    settings_path: Option<PathBuf>,
+    project_settings_path: Option<PathBuf>,
+    global_settings: Settings,
+    settings: Settings,
+    persist: bool,
 }
 
 impl SettingsManager {
-    pub fn create(_session_dir: impl Into<String>, _project_dir: impl Into<String>) -> Self {
+    pub fn create(cwd: impl Into<String>, agent_dir: impl Into<String>) -> Self {
+        let cwd = normalize_cwd(cwd.into());
+        let agent_dir = normalize_agent_dir(agent_dir.into());
+
+        let settings_path = agent_dir.as_ref().map(|dir| dir.join("settings.json"));
+        let project_settings_path = cwd
+            .as_ref()
+            .map(|dir| dir.join(".pi").join("settings.json"));
+        let global_settings = settings_path
+            .as_ref()
+            .map(|path| load_settings_from_file(path))
+            .unwrap_or_default();
+
+        let mut manager = Self {
+            settings_path,
+            project_settings_path,
+            global_settings,
+            settings: Settings::default(),
+            persist: true,
+        };
+        manager.refresh_settings();
+        manager
+    }
+
+    pub fn in_memory(settings: Settings) -> Self {
         Self {
-            compaction_settings: crate::core::compaction::DEFAULT_COMPACTION_SETTINGS,
-            auto_retry_enabled: true,
+            settings_path: None,
+            project_settings_path: None,
+            global_settings: settings.clone(),
+            settings,
+            persist: false,
         }
     }
 
     pub fn apply_overrides(&mut self, overrides: SettingsOverrides) {
-        if let Some(compaction) = overrides.compaction {
-            if let Some(enabled) = compaction.enabled {
-                self.compaction_settings.enabled = enabled;
-            }
-            if let Some(reserve_tokens) = compaction.reserve_tokens {
-                self.compaction_settings.reserve_tokens = reserve_tokens;
-            }
-            if let Some(keep_recent_tokens) = compaction.keep_recent_tokens {
-                self.compaction_settings.keep_recent_tokens = keep_recent_tokens;
-            }
-        }
+        let overrides = overrides.into_settings();
+        self.settings = merge_settings(&self.settings, &overrides);
+    }
+
+    pub fn get_last_changelog_version(&self) -> Option<String> {
+        self.settings.last_changelog_version.clone()
+    }
+
+    pub fn set_last_changelog_version(&mut self, version: &str) {
+        self.global_settings.last_changelog_version = Some(version.to_string());
+        self.save();
+    }
+
+    pub fn get_default_provider(&self) -> Option<String> {
+        self.settings.default_provider.clone()
+    }
+
+    pub fn get_default_model(&self) -> Option<String> {
+        self.settings.default_model.clone()
+    }
+
+    pub fn set_default_provider(&mut self, provider: &str) {
+        self.global_settings.default_provider = Some(provider.to_string());
+        self.save();
+    }
+
+    pub fn set_default_model(&mut self, model_id: &str) {
+        self.global_settings.default_model = Some(model_id.to_string());
+        self.save();
+    }
+
+    pub fn set_default_model_and_provider(&mut self, provider: &str, model_id: &str) {
+        self.global_settings.default_provider = Some(provider.to_string());
+        self.global_settings.default_model = Some(model_id.to_string());
+        self.save();
+    }
+
+    pub fn get_steering_mode(&self) -> String {
+        self.settings
+            .steering_mode
+            .clone()
+            .unwrap_or_else(|| "one-at-a-time".to_string())
+    }
+
+    pub fn set_steering_mode(&mut self, mode: &str) {
+        self.global_settings.steering_mode = Some(mode.to_string());
+        self.save();
+    }
+
+    pub fn get_follow_up_mode(&self) -> String {
+        self.settings
+            .follow_up_mode
+            .clone()
+            .unwrap_or_else(|| "one-at-a-time".to_string())
+    }
+
+    pub fn set_follow_up_mode(&mut self, mode: &str) {
+        self.global_settings.follow_up_mode = Some(mode.to_string());
+        self.save();
+    }
+
+    pub fn get_theme(&self) -> Option<String> {
+        self.settings.theme.clone()
+    }
+
+    pub fn set_theme(&mut self, theme: &str) {
+        self.global_settings.theme = Some(theme.to_string());
+        self.save();
+    }
+
+    pub fn get_default_thinking_level(&self) -> Option<String> {
+        self.settings.default_thinking_level.clone()
+    }
+
+    pub fn set_default_thinking_level(&mut self, level: &str) {
+        self.global_settings.default_thinking_level = Some(level.to_string());
+        self.save();
     }
 
     pub fn get_compaction_settings(&self) -> crate::core::compaction::CompactionSettings {
-        self.compaction_settings
+        crate::core::compaction::CompactionSettings {
+            enabled: self.get_compaction_enabled(),
+            reserve_tokens: self.get_compaction_reserve_tokens(),
+            keep_recent_tokens: self.get_compaction_keep_recent_tokens(),
+        }
+    }
+
+    pub fn get_compaction_enabled(&self) -> bool {
+        self.settings
+            .compaction
+            .as_ref()
+            .and_then(|settings| settings.enabled)
+            .unwrap_or(true)
     }
 
     pub fn set_compaction_enabled(&mut self, enabled: bool) {
-        self.compaction_settings.enabled = enabled;
+        let mut compaction = self.global_settings.compaction.clone().unwrap_or_default();
+        compaction.enabled = Some(enabled);
+        self.global_settings.compaction = Some(compaction);
+        self.save();
     }
 
-    pub fn is_compaction_enabled(&self) -> bool {
-        self.compaction_settings.enabled
+    pub fn get_compaction_reserve_tokens(&self) -> i64 {
+        self.settings
+            .compaction
+            .as_ref()
+            .and_then(|settings| settings.reserve_tokens)
+            .unwrap_or(16_384)
+    }
+
+    pub fn get_compaction_keep_recent_tokens(&self) -> i64 {
+        self.settings
+            .compaction
+            .as_ref()
+            .and_then(|settings| settings.keep_recent_tokens)
+            .unwrap_or(20_000)
+    }
+
+    pub fn get_branch_summary_settings(&self) -> SettingsBranchSummary {
+        SettingsBranchSummary {
+            reserve_tokens: self
+                .settings
+                .branch_summary
+                .as_ref()
+                .and_then(|settings| settings.reserve_tokens)
+                .or(Some(16_384)),
+        }
+    }
+
+    pub fn get_retry_settings(&self) -> SettingsRetry {
+        SettingsRetry {
+            enabled: Some(self.get_retry_enabled()),
+            max_retries: Some(
+                self.settings
+                    .retry
+                    .as_ref()
+                    .and_then(|settings| settings.max_retries)
+                    .unwrap_or(3),
+            ),
+            base_delay_ms: Some(
+                self.settings
+                    .retry
+                    .as_ref()
+                    .and_then(|settings| settings.base_delay_ms)
+                    .unwrap_or(2000),
+            ),
+        }
+    }
+
+    pub fn get_retry_enabled(&self) -> bool {
+        self.settings
+            .retry
+            .as_ref()
+            .and_then(|settings| settings.enabled)
+            .unwrap_or(true)
     }
 
     pub fn set_retry_enabled(&mut self, enabled: bool) {
-        self.auto_retry_enabled = enabled;
+        let mut retry = self.global_settings.retry.clone().unwrap_or_default();
+        retry.enabled = Some(enabled);
+        self.global_settings.retry = Some(retry);
+        self.save();
+    }
+
+    pub fn get_hide_thinking_block(&self) -> bool {
+        self.settings.hide_thinking_block.unwrap_or(false)
+    }
+
+    pub fn set_hide_thinking_block(&mut self, hide: bool) {
+        self.global_settings.hide_thinking_block = Some(hide);
+        self.save();
+    }
+
+    pub fn get_shell_path(&self) -> Option<String> {
+        self.settings.shell_path.clone()
+    }
+
+    pub fn set_shell_path(&mut self, path: Option<String>) {
+        self.global_settings.shell_path = path;
+        self.save();
+    }
+
+    pub fn get_collapse_changelog(&self) -> bool {
+        self.settings.collapse_changelog.unwrap_or(false)
+    }
+
+    pub fn set_collapse_changelog(&mut self, collapse: bool) {
+        self.global_settings.collapse_changelog = Some(collapse);
+        self.save();
+    }
+
+    pub fn get_extension_paths(&self) -> Vec<String> {
+        self.settings.extensions.clone().unwrap_or_default()
+    }
+
+    pub fn set_extension_paths(&mut self, paths: Vec<String>) {
+        self.global_settings.extensions = Some(paths);
+        self.save();
+    }
+
+    pub fn get_skills_enabled(&self) -> bool {
+        self.settings
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn set_skills_enabled(&mut self, enabled: bool) {
+        let mut skills = self.global_settings.skills.clone().unwrap_or_default();
+        skills.enabled = Some(enabled);
+        self.global_settings.skills = Some(skills);
+        self.save();
+    }
+
+    pub fn get_skills_settings(&self) -> SettingsSkills {
+        let skills = self.settings.skills.clone().unwrap_or_default();
+        SettingsSkills {
+            enabled: Some(skills.enabled.unwrap_or(true)),
+            enable_codex_user: Some(skills.enable_codex_user.unwrap_or(true)),
+            enable_claude_user: Some(skills.enable_claude_user.unwrap_or(true)),
+            enable_claude_project: Some(skills.enable_claude_project.unwrap_or(true)),
+            enable_pi_user: Some(skills.enable_pi_user.unwrap_or(true)),
+            enable_pi_project: Some(skills.enable_pi_project.unwrap_or(true)),
+            custom_directories: Some(skills.custom_directories.unwrap_or_default()),
+            ignored_skills: Some(skills.ignored_skills.unwrap_or_default()),
+            include_skills: Some(skills.include_skills.unwrap_or_default()),
+        }
+    }
+
+    pub fn get_show_images(&self) -> bool {
+        self.settings
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.show_images)
+            .unwrap_or(true)
+    }
+
+    pub fn set_show_images(&mut self, show: bool) {
+        let mut terminal = self.global_settings.terminal.clone().unwrap_or_default();
+        terminal.show_images = Some(show);
+        self.global_settings.terminal = Some(terminal);
+        self.save();
+    }
+
+    pub fn get_image_auto_resize(&self) -> bool {
+        self.settings
+            .images
+            .as_ref()
+            .and_then(|images| images.auto_resize)
+            .unwrap_or(true)
+    }
+
+    pub fn set_image_auto_resize(&mut self, enabled: bool) {
+        let mut images = self.global_settings.images.clone().unwrap_or_default();
+        images.auto_resize = Some(enabled);
+        self.global_settings.images = Some(images);
+        self.save();
+    }
+
+    pub fn get_enabled_models(&self) -> Option<Vec<String>> {
+        self.settings.enabled_models.clone()
+    }
+
+    pub fn get_double_escape_action(&self) -> String {
+        self.settings
+            .double_escape_action
+            .clone()
+            .unwrap_or_else(|| "tree".to_string())
+    }
+
+    pub fn set_double_escape_action(&mut self, action: &str) {
+        self.global_settings.double_escape_action = Some(action.to_string());
+        self.save();
+    }
+
+    pub fn is_compaction_enabled(&self) -> bool {
+        self.get_compaction_enabled()
     }
 
     pub fn retry_enabled(&self) -> bool {
-        self.auto_retry_enabled
+        self.get_retry_enabled()
+    }
+
+    fn refresh_settings(&mut self) {
+        let project_settings = self
+            .project_settings_path
+            .as_ref()
+            .map(|path| load_settings_from_file(path))
+            .unwrap_or_default();
+        self.settings = merge_settings(&self.global_settings, &project_settings);
+    }
+
+    fn save(&mut self) {
+        if !self.persist {
+            return;
+        }
+        let Some(path) = self.settings_path.as_ref() else {
+            return;
+        };
+
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!("Warning: Could not create settings dir: {err}");
+                return;
+            }
+        }
+
+        match serde_json::to_string_pretty(&self.global_settings) {
+            Ok(contents) => {
+                if let Err(err) = fs::write(path, contents) {
+                    eprintln!("Warning: Could not save settings file: {err}");
+                    return;
+                }
+            }
+            Err(err) => {
+                eprintln!("Warning: Could not serialize settings: {err}");
+                return;
+            }
+        }
+
+        self.refresh_settings();
     }
 }
 
@@ -826,6 +1412,92 @@ pub struct CompactionOverrides {
 
 pub struct SettingsOverrides {
     pub compaction: Option<CompactionOverrides>,
+}
+
+impl SettingsOverrides {
+    fn into_settings(self) -> Settings {
+        Settings {
+            compaction: self.compaction.map(|compaction| SettingsCompaction {
+                enabled: compaction.enabled,
+                reserve_tokens: compaction.reserve_tokens,
+                keep_recent_tokens: compaction.keep_recent_tokens,
+            }),
+            ..Settings::default()
+        }
+    }
+}
+
+fn normalize_cwd(input: String) -> Option<PathBuf> {
+    if !input.trim().is_empty() {
+        return Some(PathBuf::from(input));
+    }
+    env::current_dir().ok()
+}
+
+fn normalize_agent_dir(input: String) -> Option<PathBuf> {
+    if !input.trim().is_empty() {
+        return Some(PathBuf::from(input));
+    }
+    env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()?;
+            Some(PathBuf::from(home).join(".pi").join("agent"))
+        })
+}
+
+fn load_settings_from_file(path: &Path) -> Settings {
+    if !path.exists() {
+        return Settings::default();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            eprintln!(
+                "Warning: Could not read settings file {}: {err}",
+                path.display()
+            );
+            return Settings::default();
+        }
+    };
+
+    let value: Value = match serde_json::from_str(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "Warning: Could not parse settings file {}: {err}",
+                path.display()
+            );
+            return Settings::default();
+        }
+    };
+
+    let migrated = migrate_settings_value(value);
+    serde_json::from_value(migrated).unwrap_or_else(|err| {
+        eprintln!(
+            "Warning: Could not decode settings file {}: {err}",
+            path.display()
+        );
+        Settings::default()
+    })
+}
+
+fn migrate_settings_value(mut value: Value) -> Value {
+    if let Value::Object(ref mut map) = value {
+        let has_queue = map.contains_key("queueMode");
+        let has_steering = map.contains_key("steeringMode");
+        if has_queue && !has_steering {
+            if let Some(queue_value) = map.get("queueMode").cloned() {
+                map.insert("steeringMode".to_string(), queue_value);
+            }
+        }
+        if has_queue {
+            map.remove("queueMode");
+        }
+    }
+    value
 }
 
 #[derive(Clone, Debug, PartialEq)]

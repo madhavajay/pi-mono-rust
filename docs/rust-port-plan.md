@@ -132,6 +132,7 @@ Planned modules (initial, not final):
 - System prompt builder now mirrors TS defaults (tools/guidelines, project context files, skills; `--skills`/`--no-skills`).
 - HTML export now uses the TS template assets with the default dark theme and supports CLI `--export` + RPC `export_html`.
 - CLI `--thinking` sets the initial thinking level and persists it to the session.
+- Settings manager now loads `settings.json` (global + project override) for compaction/retry/theme defaults and persists global updates.
 - RPC prompt streamingBehavior now matches TS (only queues when streaming; images are ignored during queueing).
 - RPC mode now supports `openai-responses` models alongside `anthropic-messages`.
 - Interactive mode now supports a basic line-based REPL (full TUI pending).
