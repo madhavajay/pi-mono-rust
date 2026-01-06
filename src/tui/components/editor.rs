@@ -49,6 +49,10 @@ impl Editor {
         }
     }
 
+    pub fn set_theme(&mut self, theme: EditorTheme) {
+        self.theme = theme;
+    }
+
     pub fn add_to_history(&mut self, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {

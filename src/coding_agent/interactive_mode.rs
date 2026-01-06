@@ -46,18 +46,23 @@ impl InteractiveMode {
 pub fn format_message_for_interactive(
     message: &AgentMessage,
     include_user: bool,
+    hide_thinking: bool,
+    show_images: bool,
 ) -> Option<String> {
     match message {
         AgentMessage::User(user) => {
             if include_user {
-                Some(format!("You:\n{}", format_user_content(&user.content)))
+                Some(format!(
+                    "You:\n{}",
+                    format_user_content(&user.content, hide_thinking, show_images)
+                ))
             } else {
                 None
             }
         }
         AgentMessage::Assistant(assistant) => Some(format!(
             "Assistant:\n{}",
-            format_content_blocks(&assistant.content)
+            format_content_blocks(&assistant.content, hide_thinking, show_images)
         )),
         AgentMessage::ToolResult(result) => {
             let label = if result.is_error {
@@ -69,7 +74,7 @@ pub fn format_message_for_interactive(
                 "{}: {}\n{}",
                 label,
                 result.tool_name,
-                format_content_blocks(&result.content)
+                format_content_blocks(&result.content, hide_thinking, show_images)
             );
             if let Some(details) = result.details.as_ref().filter(|value| !value.is_null()) {
                 entry.push_str("\n\nDetails:\n");
@@ -83,7 +88,11 @@ pub fn format_message_for_interactive(
     }
 }
 
-pub fn format_content_blocks(blocks: &[ContentBlock]) -> String {
+pub fn format_content_blocks(
+    blocks: &[ContentBlock],
+    hide_thinking: bool,
+    show_images: bool,
+) -> String {
     let mut parts = Vec::new();
     for block in blocks {
         match block {
@@ -93,6 +102,9 @@ pub fn format_content_blocks(blocks: &[ContentBlock]) -> String {
                 }
             }
             ContentBlock::Thinking { thinking, .. } => {
+                if hide_thinking {
+                    continue;
+                }
                 if thinking.is_empty() {
                     parts.push("Thinking:\n[empty]".to_string());
                 } else {
@@ -111,7 +123,9 @@ pub fn format_content_blocks(blocks: &[ContentBlock]) -> String {
                 parts.push(entry);
             }
             ContentBlock::Image { mime_type, .. } => {
-                parts.push(format!("Image attachment ({mime_type})"));
+                if show_images {
+                    parts.push(format!("Image attachment ({mime_type})"));
+                }
             }
         }
     }
@@ -122,7 +136,7 @@ pub fn format_content_blocks(blocks: &[ContentBlock]) -> String {
     }
 }
 
-fn format_user_content(content: &UserContent) -> String {
+fn format_user_content(content: &UserContent, hide_thinking: bool, show_images: bool) -> String {
     match content {
         UserContent::Text(text) => {
             if text.trim().is_empty() {
@@ -131,7 +145,7 @@ fn format_user_content(content: &UserContent) -> String {
                 text.clone()
             }
         }
-        UserContent::Blocks(blocks) => format_content_blocks(blocks),
+        UserContent::Blocks(blocks) => format_content_blocks(blocks, hide_thinking, show_images),
     }
 }
 

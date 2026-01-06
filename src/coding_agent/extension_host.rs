@@ -17,6 +17,8 @@ const EXTENSION_HOST_JS: &str = include_str!(concat!(
     "/src/assets/extension-host.js"
 ));
 
+type UiHandler = Box<dyn Fn(&ExtensionUiRequest) -> ExtensionUiResponse>;
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionTool {
@@ -252,6 +254,37 @@ pub struct ExtensionToolExecuteResult {
     pub is_error: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionUiRequest {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub method: String,
+    pub title: Option<String>,
+    pub message: Option<String>,
+    pub options: Option<Vec<String>>,
+    pub placeholder: Option<String>,
+    pub prefill: Option<String>,
+    pub notify_type: Option<String>,
+    pub status_key: Option<String>,
+    pub status_text: Option<String>,
+    pub widget_key: Option<String>,
+    pub widget_lines: Option<Vec<String>>,
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionUiResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<bool>,
+}
+
 pub struct ExtensionHost {
     child: Child,
     stdin: ChildStdin,
@@ -259,6 +292,7 @@ pub struct ExtensionHost {
     next_id: u64,
     script_path: PathBuf,
     cwd: String,
+    ui_handler: Option<UiHandler>,
 }
 
 impl ExtensionHost {
@@ -305,6 +339,7 @@ impl ExtensionHost {
             next_id: 1,
             script_path: script_path.clone(),
             cwd: cwd.to_string_lossy().to_string(),
+            ui_handler: Some(Box::new(default_ui_handler)),
         };
 
         let extension_paths = supported
@@ -541,6 +576,13 @@ impl ExtensionHost {
         parse_tool_invoke_result(value)
     }
 
+    pub fn set_ui_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(&ExtensionUiRequest) -> ExtensionUiResponse + 'static,
+    {
+        self.ui_handler = Some(Box::new(handler));
+    }
+
     fn build_context(&self, session_entries: &[SessionEntry]) -> ExtensionContextPayload {
         ExtensionContextPayload {
             cwd: self.cwd.clone(),
@@ -563,16 +605,29 @@ impl ExtensionHost {
             .flush()
             .map_err(|err| format!("Failed to flush extension request: {err}"))?;
 
-        let mut response_line = String::new();
-        let bytes = self
-            .stdout
-            .read_line(&mut response_line)
-            .map_err(|err| format!("Failed to read extension response: {err}"))?;
-        if bytes == 0 {
-            return Err("Extension host closed unexpectedly".to_string());
+        loop {
+            let mut response_line = String::new();
+            let bytes = self
+                .stdout
+                .read_line(&mut response_line)
+                .map_err(|err| format!("Failed to read extension response: {err}"))?;
+            if bytes == 0 {
+                return Err("Extension host closed unexpectedly".to_string());
+            }
+            let value: Value = serde_json::from_str(&response_line)
+                .map_err(|err| format!("Failed to parse extension response: {err}"))?;
+            if let Some(kind) = value.get("type").and_then(|value| value.as_str()) {
+                if kind == "extension_ui_request" {
+                    let request = serde_json::from_value::<ExtensionUiRequest>(value)
+                        .map_err(|err| format!("Failed to parse extension UI request: {err}"))?;
+                    self.handle_ui_request(&request)?;
+                    continue;
+                }
+            }
+            let response = serde_json::from_value::<HostResponse>(value)
+                .map_err(|err| format!("Failed to parse extension response: {err}"))?;
+            return Ok(response);
         }
-        serde_json::from_str(&response_line)
-            .map_err(|err| format!("Failed to parse extension response: {err}"))
     }
 
     fn emit_event(
@@ -593,6 +648,47 @@ impl ExtensionHost {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    fn handle_ui_request(&mut self, request: &ExtensionUiRequest) -> Result<(), String> {
+        let response = if let Some(handler) = self.ui_handler.as_ref() {
+            handler(request)
+        } else {
+            default_ui_handler(request)
+        };
+        let payload = serde_json::to_string(&serde_json::json!({
+            "type": "extension_ui_response",
+            "id": request.id,
+            "value": response.value,
+            "confirmed": response.confirmed,
+            "cancelled": response.cancelled,
+        }))
+        .map_err(|err| format!("Failed to serialize extension UI response: {err}"))?;
+        self.stdin
+            .write_all(payload.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .map_err(|err| format!("Failed to send extension UI response: {err}"))?;
+        self.stdin
+            .flush()
+            .map_err(|err| format!("Failed to flush extension UI response: {err}"))?;
+        Ok(())
+    }
+}
+
+fn default_ui_handler(request: &ExtensionUiRequest) -> ExtensionUiResponse {
+    match request.method.as_str() {
+        "confirm" => ExtensionUiResponse {
+            confirmed: Some(false),
+            ..Default::default()
+        },
+        "select" | "input" | "editor" => ExtensionUiResponse {
+            cancelled: Some(true),
+            ..Default::default()
+        },
+        _ => ExtensionUiResponse {
+            cancelled: Some(true),
+            ..Default::default()
+        },
     }
 }
 

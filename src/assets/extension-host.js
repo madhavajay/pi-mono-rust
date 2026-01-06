@@ -22,6 +22,90 @@ function createNoOpUI() {
   };
 }
 
+let nextUiRequestId = 0;
+const pendingUiRequests = new Map();
+
+function sendUiRequest(message, waitForResponse) {
+  const id = String((nextUiRequestId += 1));
+  const payload = { type: "extension_ui_request", id, ...message };
+
+  if (!waitForResponse) {
+    process.stdout.write(JSON.stringify(payload) + "\n");
+    return undefined;
+  }
+
+  return new Promise((resolve, reject) => {
+    pendingUiRequests.set(id, { resolve, reject });
+    process.stdout.write(JSON.stringify(payload) + "\n");
+  });
+}
+
+function createRpcUI() {
+  return {
+    select: async (title, options) => {
+      const response = await sendUiRequest(
+        { method: "select", title, options },
+        true,
+      );
+      if (response && response.cancelled) return undefined;
+      if (response && "value" in response) return response.value;
+      return undefined;
+    },
+    confirm: async (title, message) => {
+      const response = await sendUiRequest(
+        { method: "confirm", title, message },
+        true,
+      );
+      if (response && response.cancelled) return false;
+      if (response && "confirmed" in response) return response.confirmed;
+      return false;
+    },
+    input: async (title, placeholder) => {
+      const response = await sendUiRequest(
+        { method: "input", title, placeholder },
+        true,
+      );
+      if (response && response.cancelled) return undefined;
+      if (response && "value" in response) return response.value;
+      return undefined;
+    },
+    notify: (message, type) => {
+      sendUiRequest({ method: "notify", message, notifyType: type }, false);
+    },
+    setStatus: (key, text) => {
+      sendUiRequest({ method: "setStatus", statusKey: key, statusText: text }, false);
+    },
+    setWidget: (key, content) => {
+      if (content === undefined || Array.isArray(content)) {
+        sendUiRequest(
+          { method: "setWidget", widgetKey: key, widgetLines: content },
+          false,
+        );
+      }
+    },
+    setTitle: (title) => {
+      sendUiRequest({ method: "setTitle", title }, false);
+    },
+    custom: async () => undefined,
+    setEditorText: (text) => {
+      sendUiRequest({ method: "set_editor_text", text }, false);
+    },
+    getEditorText: () => "",
+    editor: async (title, prefill) => {
+      const response = await sendUiRequest(
+        { method: "editor", title, prefill },
+        true,
+      );
+      if (response && response.cancelled) return undefined;
+      if (response && "value" in response) return response.value;
+      return undefined;
+    },
+    get theme() {
+      return {};
+    },
+  };
+}
+
 function createAbortSignal() {
   return {
     aborted: false,
@@ -168,7 +252,7 @@ function createContext(payload) {
   const sessionEntries = Array.isArray(data.sessionEntries) ? data.sessionEntries : [];
   const model = data.model;
   return {
-    ui: createNoOpUI(),
+    ui: createRpcUI(),
     hasUI: Boolean(data.hasUI),
     cwd: data.cwd || process.cwd(),
     sessionManager: {
@@ -355,13 +439,33 @@ async function main() {
       continue;
     }
 
-    const response = await handleMessage(message, state);
-    process.stdout.write(
-      JSON.stringify({
-        id: message.id ?? null,
-        ...response,
-      }) + "\n",
-    );
+    if (message.type === "extension_ui_response") {
+      const pending = pendingUiRequests.get(message.id);
+      if (pending) {
+        pendingUiRequests.delete(message.id);
+        pending.resolve(message);
+      }
+      continue;
+    }
+
+    handleMessage(message, state)
+      .then((response) => {
+        process.stdout.write(
+          JSON.stringify({
+            id: message.id ?? null,
+            ...response,
+          }) + "\n",
+        );
+      })
+      .catch((err) => {
+        process.stdout.write(
+          JSON.stringify({
+            id: message.id ?? null,
+            ok: false,
+            error: err && err.message ? err.message : String(err),
+          }) + "\n",
+        );
+      });
   }
 }
 

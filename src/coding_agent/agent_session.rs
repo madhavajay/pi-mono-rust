@@ -523,6 +523,13 @@ impl AgentSession {
     }
 
     pub fn compact(&mut self) -> Result<CompactionResult, AgentSessionError> {
+        self.compact_with_instructions(None)
+    }
+
+    pub fn compact_with_instructions(
+        &mut self,
+        custom_instructions: Option<&str>,
+    ) -> Result<CompactionResult, AgentSessionError> {
         let branch_entries = self.session_manager.get_branch(None);
         let settings = self.settings_manager.get_compaction_settings();
         let preparation = prepare_compaction(&branch_entries, settings).ok_or_else(|| {
@@ -555,7 +562,8 @@ impl AgentSession {
             }
         }
 
-        let mut summary = summarize_compaction_messages(&preparation.messages_to_summarize);
+        let mut summary =
+            summarize_compaction_messages(&preparation.messages_to_summarize, custom_instructions);
         if summary.trim().is_empty() {
             summary = "Summary.".to_string();
         }
@@ -1862,7 +1870,10 @@ fn clip_words(text: &str, max_words: usize) -> String {
     kept.join(" ")
 }
 
-fn summarize_compaction_messages(messages: &[CoreAgentMessage]) -> String {
+fn summarize_compaction_messages(
+    messages: &[CoreAgentMessage],
+    custom_instructions: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     for message in messages {
         match message {
@@ -1915,7 +1926,12 @@ fn summarize_compaction_messages(messages: &[CoreAgentMessage]) -> String {
     }
 
     let merged = parts.join(" ");
-    format!("Summary: {}", clip_words(&merged, 32))
+    let mut summary = format!("Summary: {}", clip_words(&merged, 32));
+    if let Some(instructions) = custom_instructions {
+        summary.push(' ');
+        summary.push_str(&clip_words(instructions, 6));
+    }
+    summary
 }
 
 fn wrap_tools_with_extension_host(

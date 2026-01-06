@@ -405,12 +405,20 @@ fn build_stream_fn(
     tool_specs: Vec<AnthropicTool>,
 ) -> AgentStreamFn {
     Box::new(move |_agent_model, context, events| {
-        let system = if !context.system_prompt.trim().is_empty() {
-            Some(context.system_prompt.as_str())
-        } else if use_oauth {
-            Some(DEFAULT_OAUTH_SYSTEM_PROMPT)
+        // OAuth tokens require the Claude Code identification in the system prompt
+        let system_with_oauth_prefix = if use_oauth {
+            if context.system_prompt.trim().is_empty() {
+                DEFAULT_OAUTH_SYSTEM_PROMPT.to_string()
+            } else {
+                format!("{}\n\n{}", DEFAULT_OAUTH_SYSTEM_PROMPT, context.system_prompt)
+            }
         } else {
+            context.system_prompt.clone()
+        };
+        let system = if system_with_oauth_prefix.trim().is_empty() {
             None
+        } else {
+            Some(system_with_oauth_prefix.as_str())
         };
 
         let messages = build_anthropic_messages(context);

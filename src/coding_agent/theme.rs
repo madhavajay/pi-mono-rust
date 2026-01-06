@@ -314,9 +314,10 @@ pub fn available_themes() -> Vec<String> {
             let path = entry.path();
             if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
                 if path.extension().and_then(|value| value.to_str()) == Some("json")
-                    && !names.iter().any(|name| name == stem) {
-                        names.push(stem.to_string());
-                    }
+                    && !names.iter().any(|name| name == stem)
+                {
+                    names.push(stem.to_string());
+                }
             }
         }
     }

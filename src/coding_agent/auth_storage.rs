@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -9,18 +11,27 @@ pub enum AuthCredential {
     ApiKey {
         key: String,
     },
+    #[serde(rename = "oauth")]
     OAuth {
         access: String,
         #[serde(default)]
         refresh: Option<String>,
         #[serde(default)]
         expires: Option<i64>,
-        #[serde(default)]
+        #[serde(default, alias = "enterpriseUrl")]
         enterprise_url: Option<String>,
+        #[serde(default, alias = "projectId")]
+        project_id: Option<String>,
+        #[serde(default, alias = "email")]
+        email: Option<String>,
+        #[serde(default, alias = "accountId")]
+        account_id: Option<String>,
     },
 }
 
 type FallbackResolver = Box<dyn Fn(&str) -> Option<String>>;
+
+static VERTEX_ADC_EXISTS: OnceLock<bool> = OnceLock::new();
 
 pub struct AuthStorage {
     path: PathBuf,
@@ -100,6 +111,9 @@ impl AuthStorage {
         if self.data.contains_key(provider) {
             return true;
         }
+        if env_api_key(provider).is_some() {
+            return true;
+        }
         if let Some(resolver) = &self.fallback_resolver {
             return resolver(provider).is_some();
         }
@@ -114,10 +128,14 @@ impl AuthStorage {
         match self.data.get(provider) {
             Some(AuthCredential::ApiKey { key }) => Some(key.clone()),
             Some(AuthCredential::OAuth { access, .. }) => Some(access.clone()),
-            None => self
-                .fallback_resolver
-                .as_ref()
-                .and_then(|resolver| resolver(provider)),
+            None => {
+                if let Some(env_key) = env_api_key(provider) {
+                    return Some(env_key);
+                }
+                self.fallback_resolver
+                    .as_ref()
+                    .and_then(|resolver| resolver(provider))
+            }
         }
     }
 
@@ -132,4 +150,63 @@ impl AuthStorage {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn env_api_key(provider: &str) -> Option<String> {
+    if provider == "github-copilot" {
+        return env_var_non_empty("COPILOT_GITHUB_TOKEN")
+            .or_else(|| env_var_non_empty("GH_TOKEN"))
+            .or_else(|| env_var_non_empty("GITHUB_TOKEN"));
+    }
+
+    if provider == "anthropic" {
+        return env_var_non_empty("ANTHROPIC_OAUTH_TOKEN")
+            .or_else(|| env_var_non_empty("ANTHROPIC_API_KEY"));
+    }
+
+    if provider == "google-vertex" && has_vertex_adc_credentials() {
+        let has_project = env::var("GOOGLE_CLOUD_PROJECT").is_ok()
+            || env::var("GCLOUD_PROJECT").is_ok();
+        let has_location = env::var("GOOGLE_CLOUD_LOCATION").is_ok();
+        if has_project && has_location {
+            return Some("<authenticated>".to_string());
+        }
+    }
+
+    let env_var = match provider {
+        "openai" => "OPENAI_API_KEY",
+        "google" => "GEMINI_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "cerebras" => "CEREBRAS_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "zai" => "ZAI_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        _ => return None,
+    };
+    env_var_non_empty(env_var)
+}
+
+fn env_var_non_empty(key: &str) -> Option<String> {
+    env::var(key).ok().and_then(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
+fn has_vertex_adc_credentials() -> bool {
+    *VERTEX_ADC_EXISTS.get_or_init(|| {
+        let home_dir = env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = home_dir
+            .join(".config")
+            .join("gcloud")
+            .join("application_default_credentials.json");
+        path.exists()
+    })
 }

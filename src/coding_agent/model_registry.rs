@@ -72,6 +72,31 @@ struct ModelCost {
     cache_write: f64,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuiltInModelCost {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuiltInModelDefinition {
+    id: String,
+    name: String,
+    api: String,
+    provider: String,
+    base_url: String,
+    reasoning: bool,
+    input: Vec<String>,
+    cost: BuiltInModelCost,
+    context_window: i64,
+    max_tokens: i64,
+    headers: Option<HashMap<String, String>>,
+}
+
 pub struct ModelRegistry {
     auth_storage: AuthStorage,
     models_json_path: Option<PathBuf>,
@@ -256,40 +281,7 @@ fn load_built_in_models(
 ) -> Vec<Model> {
     let mut models = Vec::new();
 
-    let built_ins = vec![
-        built_in_model(
-            "anthropic",
-            "claude-sonnet-4-5",
-            "Claude Sonnet 4.5",
-            "anthropic-messages",
-            "https://api.anthropic.com/v1",
-            true,
-        ),
-        built_in_model(
-            "anthropic",
-            "claude-3-5-haiku-20241022",
-            "Claude 3.5 Haiku",
-            "anthropic-messages",
-            "https://api.anthropic.com/v1",
-            false,
-        ),
-        built_in_model(
-            "google",
-            "gemini-2.5-flash",
-            "Gemini 2.5 Flash",
-            "google-generative-ai",
-            "https://generativelanguage.googleapis.com",
-            true,
-        ),
-        built_in_model(
-            "openai",
-            "gpt-4o-mini",
-            "GPT-4o mini",
-            "openai-responses",
-            "https://api.openai.com/v1",
-            false,
-        ),
-    ];
+    let built_ins = load_built_in_models_from_json();
 
     for model in built_ins {
         if replaced.contains(&model.provider) {
@@ -313,31 +305,59 @@ fn load_built_in_models(
     models
 }
 
-fn built_in_model(
-    provider: &str,
-    id: &str,
-    name: &str,
-    api: &str,
-    base_url: &str,
-    reasoning: bool,
-) -> Model {
+fn load_built_in_models_from_json() -> Vec<Model> {
+    let content = include_str!("../assets/models.generated.json");
+    let parsed =
+        serde_json::from_str::<HashMap<String, HashMap<String, BuiltInModelDefinition>>>(content);
+    let mut models = Vec::new();
+
+    let Ok(parsed) = parsed else {
+        eprintln!("Warning: Failed to parse built-in models JSON.");
+        return models;
+    };
+
+    for models_by_provider in parsed.values() {
+        for model in models_by_provider.values() {
+            models.push(model_from_builtin(model));
+        }
+    }
+
+    models
+}
+
+fn model_from_builtin(model: &BuiltInModelDefinition) -> Model {
+    let base_url = normalize_base_url(&model.api, &model.base_url);
+    let mut headers = model.headers.clone();
+    if headers.as_ref().is_some_and(|value| value.is_empty()) {
+        headers = None;
+    }
+    let cost = Cost {
+        input: model.cost.input,
+        output: model.cost.output,
+        cache_read: model.cost.cache_read,
+        cache_write: model.cost.cache_write,
+        total: model.cost.input + model.cost.output + model.cost.cache_read + model.cost.cache_write,
+    };
     Model {
-        id: id.to_string(),
-        name: name.to_string(),
-        api: api.to_string(),
-        provider: provider.to_string(),
-        base_url: base_url.to_string(),
-        reasoning,
-        input: vec!["text".to_string(), "image".to_string()],
-        cost: Cost {
-            input: 0.0,
-            output: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-            total: 0.0,
-        },
-        context_window: 100_000,
-        max_tokens: 8_000,
-        headers: None,
+        id: model.id.clone(),
+        name: model.name.clone(),
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        base_url,
+        reasoning: model.reasoning,
+        input: model.input.clone(),
+        cost,
+        context_window: model.context_window,
+        max_tokens: model.max_tokens,
+        headers,
+    }
+}
+
+fn normalize_base_url(api: &str, base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if api == "anthropic-messages" && !trimmed.ends_with("/v1") {
+        format!("{trimmed}/v1")
+    } else {
+        trimmed.to_string()
     }
 }

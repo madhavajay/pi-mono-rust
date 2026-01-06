@@ -17,11 +17,26 @@ pub struct AnthropicRequest {
     pub max_tokens: u32,
     pub messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<Vec<AnthropicSystemContent>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AnthropicSystemContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    pub control_type: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -228,10 +243,16 @@ fn build_anthropic_headers(
 ) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    headers.insert(
+        "anthropic-dangerous-direct-browser-access",
+        HeaderValue::from_static("true"),
+    );
     if use_oauth {
         headers.insert(
             "anthropic-beta",
-            HeaderValue::from_static("oauth-2025-04-20"),
+            HeaderValue::from_static(
+                "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+            ),
         );
         let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|err| format!("Invalid OAuth token: {err}"))?;
@@ -273,6 +294,48 @@ fn build_openai_headers(
     Ok(headers)
 }
 
+fn build_system_content(system: Option<&str>, use_oauth: bool) -> Option<Vec<AnthropicSystemContent>> {
+    if use_oauth {
+        // For OAuth tokens, Claude Code identification MUST be the first separate element
+        let claude_code_id = AnthropicSystemContent {
+            content_type: "text".to_string(),
+            text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            cache_control: Some(AnthropicCacheControl {
+                control_type: "ephemeral".to_string(),
+            }),
+        };
+
+        // Strip the Claude Code identification from the main system prompt if present
+        let main_prompt = system.map(|s| {
+            s.trim_start_matches("You are Claude Code, Anthropic's official CLI for Claude.")
+                .trim_start_matches("\n\n")
+                .trim_start()
+        });
+
+        match main_prompt {
+            Some(text) if !text.is_empty() => Some(vec![
+                claude_code_id,
+                AnthropicSystemContent {
+                    content_type: "text".to_string(),
+                    text: text.to_string(),
+                    cache_control: Some(AnthropicCacheControl {
+                        control_type: "ephemeral".to_string(),
+                    }),
+                },
+            ]),
+            _ => Some(vec![claude_code_id]),
+        }
+    } else {
+        system.map(|text| {
+            vec![AnthropicSystemContent {
+                content_type: "text".to_string(),
+                text: text.to_string(),
+                cache_control: None,
+            }]
+        })
+    }
+}
+
 pub fn call_anthropic(
     messages: Vec<AnthropicMessage>,
     options: AnthropicCallOptions<'_>,
@@ -281,7 +344,7 @@ pub fn call_anthropic(
         model: options.model.to_string(),
         max_tokens: 1024,
         messages,
-        system: options.system.map(|value| value.to_string()),
+        system: build_system_content(options.system, options.use_oauth),
         tools: if options.tools.is_empty() {
             None
         } else {
@@ -468,7 +531,7 @@ pub fn stream_anthropic(
         model: options.model.to_string(),
         max_tokens: 1024,
         messages,
-        system: options.system.map(|value| value.to_string()),
+        system: build_system_content(options.system, options.use_oauth),
         tools: if options.tools.is_empty() {
             None
         } else {
@@ -482,7 +545,7 @@ pub fn stream_anthropic(
     let endpoint = format!("{}/messages", options.base_url.trim_end_matches('/'));
     let client = Client::new();
     let mut response = client
-        .post(endpoint)
+        .post(&endpoint)
         .headers(headers)
         .json(&request)
         .send()

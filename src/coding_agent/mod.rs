@@ -8,6 +8,7 @@ pub mod tools;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub mod agent_session;
 pub mod auth_storage;
+pub mod changelog;
 pub mod hooks;
 pub mod interactive_mode;
 pub mod model_registry;
@@ -25,8 +26,11 @@ pub use agent_session::{
     ThinkingLevelCycleResult, TokenStats,
 };
 pub use auth_storage::{AuthCredential, AuthStorage};
+pub use changelog::{get_changelog_path, parse_changelog, ChangelogEntry};
 pub use export_html::{export_from_file, export_session_to_html};
-pub use extension_host::{ExtensionHost, ExtensionManifest};
+pub use extension_host::{
+    ExtensionHost, ExtensionManifest, ExtensionUiRequest, ExtensionUiResponse,
+};
 pub use extension_runner::{
     ExtensionRunner, RegisteredCommand, RegisteredFlag, RegisteredMessageRenderer,
     RegisteredShortcut, RegisteredTool,

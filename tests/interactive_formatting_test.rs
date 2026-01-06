@@ -44,7 +44,8 @@ fn formats_assistant_with_tool_call() {
         },
     ]));
 
-    let formatted = format_message_for_interactive(&message, true).expect("expected output");
+    let formatted =
+        format_message_for_interactive(&message, true, false, true).expect("expected output");
     assert!(formatted.contains("Assistant:\n"));
     assert!(formatted.contains("Hello"));
     assert!(formatted.contains("Tool call: calc"));
@@ -65,7 +66,8 @@ fn formats_tool_result_error_with_details() {
         timestamp: 0,
     });
 
-    let formatted = format_message_for_interactive(&message, true).expect("expected output");
+    let formatted =
+        format_message_for_interactive(&message, true, false, true).expect("expected output");
     assert!(formatted.contains("Tool result (error): calc"));
     assert!(formatted.contains("oops"));
     assert!(formatted.contains("Details:"));
@@ -79,6 +81,25 @@ fn skips_user_message_when_disabled() {
         timestamp: 0,
     });
 
-    let formatted = format_message_for_interactive(&message, false);
+    let formatted = format_message_for_interactive(&message, false, false, true);
     assert!(formatted.is_none());
+}
+
+#[test]
+fn hides_thinking_blocks_when_disabled() {
+    let message = AgentMessage::Assistant(assistant_message(vec![
+        ContentBlock::Thinking {
+            thinking: "Reasoning".to_string(),
+            thinking_signature: None,
+        },
+        ContentBlock::Text {
+            text: "Hello".to_string(),
+            text_signature: None,
+        },
+    ]));
+
+    let formatted =
+        format_message_for_interactive(&message, true, true, true).expect("expected output");
+    assert!(!formatted.contains("Thinking:"));
+    assert!(formatted.contains("Hello"));
 }

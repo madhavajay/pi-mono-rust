@@ -123,8 +123,12 @@ Planned modules (initial, not final):
 - Session manager + compaction logic with ported tests (deterministic only).
 - Session migration now matches TS v3 (hookMessage -> custom) and writes version 3 headers.
 - CLI arg parsing parity tests.
-- Print mode wired to Anthropic Messages API and OpenAI Responses API (non-streaming).
+- Print mode wired to Anthropic Messages API and OpenAI Responses API.
 - Auth reuse via `~/.pi/agent/auth.json` or `PI_CODING_AGENT_DIR` fallback.
+- **OAuth support for Anthropic** - Full parity with TS OAuth implementation:
+  - Reads OAuth credentials from `auth.json` (`type: "oauth"` with access/refresh/expires).
+  - Sends required headers: `anthropic-beta: oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14`.
+  - System prompt format matches TS: two-element array with Claude Code identification as first element, both with `cache_control: {type: "ephemeral"}`.
 - Print mode uses AgentSession tool loop with built-in `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`.
 - Default tool allowlist now matches TS (`read`, `bash`, `edit`, `write`) with `grep`/`find`/`ls` opt-in; extension tools are included when `--tools` is not specified.
 - Grep now supports directory search with regex/literal matching plus truncation notices for grep/find/ls output.
@@ -158,6 +162,11 @@ Planned modules (initial, not final):
 - Interactive mode now supports `/model`, `/settings`, `/changelog`, and `/hotkeys` in the basic TUI (line-based flow).
 - CLI refactor: extracted RPC handlers, API wrappers, and mode runners into dedicated modules; main.rs is now slim.
 - Streaming now uses SSE parsing for Anthropic/OpenAI Responses and emits incremental agent events.
+
+## Remaining Gaps (Next)
+- OpenAI Codex provider support (request transformer, prompt cache with etag fallback, error parsing, codex responses streaming) + tests.
+- Interactive TUI parity: inline images (Kitty/iTerm2), selectors/keybindings, tool output expansion, session tree UX, theme reload.
+- TS extensions support in the JS host (jiti-based loading) + parity tests.
 
 ## Test Plan
 ### Baseline (TS)

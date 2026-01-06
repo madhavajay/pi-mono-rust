@@ -14,6 +14,15 @@ pub struct ToolDefinition {
     pub execute: fn(&Value, &ToolContext) -> Result<String, String>,
 }
 
+const DEFAULT_TOOL_NAMES: [&str; 4] = ["read", "bash", "edit", "write"];
+
+pub fn default_tool_names() -> Vec<String> {
+    DEFAULT_TOOL_NAMES
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
+}
+
 pub fn default_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
