@@ -64,8 +64,7 @@ pub struct Args {
     pub session_dir: Option<String>,
     pub models: Option<Vec<String>>,
     pub tools: Option<Vec<String>>,
-    pub hooks: Option<Vec<String>>,
-    pub custom_tools: Option<Vec<String>>,
+    pub extensions: Option<Vec<String>>,
     pub print: bool,
     pub export: Option<String>,
     pub no_skills: bool,
@@ -99,8 +98,7 @@ pub fn parse_args(args: &[String]) -> Args {
         session_dir: None,
         models: None,
         tools: None,
-        hooks: None,
-        custom_tools: None,
+        extensions: None,
         print: false,
         export: None,
         no_skills: false,
@@ -209,16 +207,9 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.export = Some(args[i + 1].clone());
                 i += 1;
             }
-            "--hook" if i + 1 < args.len() => {
+            "--extension" | "-e" if i + 1 < args.len() => {
                 result
-                    .hooks
-                    .get_or_insert_with(Vec::new)
-                    .push(args[i + 1].clone());
-                i += 1;
-            }
-            "--tool" if i + 1 < args.len() => {
-                result
-                    .custom_tools
+                    .extensions
                     .get_or_insert_with(Vec::new)
                     .push(args[i + 1].clone());
                 i += 1;

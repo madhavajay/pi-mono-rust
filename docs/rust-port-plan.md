@@ -139,6 +139,7 @@ Planned modules (initial, not final):
 - RPC mode now supports `openai-responses` models alongside `anthropic-messages`.
 - Interactive mode now supports a basic line-based REPL (full TUI pending).
 - CLI `--resume` now lists available sessions and prompts for a selection in the line-based UI.
+- CLI now parses `--extension`/`-e` and persists extension paths to settings (extension execution pending).
 
 ## Test Plan
 ### Baseline (TS)

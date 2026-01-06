@@ -54,26 +54,20 @@ Options:
   --list-models    List available models
   --export <file>  Export session file to HTML and exit
   --mode <mode>    Output mode: text (default), json, rpc
+  --extension, -e  Load an extension file (can be used multiple times)
   --no-skills      Disable skills discovery and loading
   --skills         Comma-separated glob patterns to filter skills
   @file            Include file contents in prompt (text or images)
 
 Notes:
   Interactive mode is line-based (full TUI pending).
-  --hook and --tool are not implemented yet."
+  Extension execution is not implemented yet in the Rust port."
     );
 }
 
 fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
-    let mut unsupported = Vec::new();
-
-    if parsed.hooks.is_some() {
-        unsupported.push("--hook");
-    }
-    if parsed.custom_tools.is_some() {
-        unsupported.push("--tool");
-    }
-    unsupported
+    let _ = parsed;
+    Vec::new()
 }
 
 type AuthStorageData = HashMap<String, AuthCredential>;
@@ -1393,6 +1387,15 @@ fn main() {
         );
         process::exit(1);
     }
+    if parsed
+        .extensions
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty())
+    {
+        eprintln!(
+            "Warning: extensions are configured, but extension execution is not implemented yet."
+        );
+    }
 
     let is_interactive = !parsed.print && parsed.mode.is_none();
 
@@ -1498,6 +1501,9 @@ fn main() {
                 process::exit(1);
             }
         };
+        if let Some(paths) = parsed.extensions.as_deref() {
+            session.settings_manager.set_extension_paths(paths.to_vec());
+        }
         apply_cli_thinking_level(&parsed, &mut session);
         if let Err(message) = run_rpc_mode(session) {
             eprintln!("Error: {message}");
@@ -1545,6 +1551,9 @@ fn main() {
             process::exit(1);
         }
     };
+    if let Some(paths) = parsed.extensions.as_deref() {
+        session.settings_manager.set_extension_paths(paths.to_vec());
+    }
     apply_cli_thinking_level(&parsed, &mut session);
 
     let result = if is_interactive {

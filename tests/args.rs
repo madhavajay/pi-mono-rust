@@ -114,14 +114,17 @@ fn parses_no_session_flag() {
 }
 
 #[test]
-fn parses_hook_flags() {
-    let result = parse(&["--hook", "./my-hook.ts"]);
-    assert_eq!(result.hooks, Some(vec!["./my-hook.ts".to_string()]));
-
-    let result = parse(&["--hook", "./hook1.ts", "--hook", "./hook2.ts"]);
+fn parses_extension_flags() {
+    let result = parse(&["--extension", "./my-extension.ts"]);
     assert_eq!(
-        result.hooks,
-        Some(vec!["./hook1.ts".to_string(), "./hook2.ts".to_string()])
+        result.extensions,
+        Some(vec!["./my-extension.ts".to_string()])
+    );
+
+    let result = parse(&["-e", "./ext1.ts", "--extension", "./ext2.ts"]);
+    assert_eq!(
+        result.extensions,
+        Some(vec!["./ext1.ts".to_string(), "./ext2.ts".to_string()])
     );
 }
 
