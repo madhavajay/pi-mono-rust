@@ -171,9 +171,18 @@ Planned modules (initial, not final):
   - Integration with session.rs for `openai-codex-responses` API type.
   - Auth module extended with `resolve_openai_codex_credentials` for separate Codex OAuth tokens.
   - **Tests ported from TS**: `tests/openai_codex_test.rs` covers request transformation, model normalization, error parsing, include handling, and SSE parsing (matching `openai-codex.test.ts`, `openai-codex-include.test.ts`, `openai-codex-stream.test.ts`).
+- **Inline image support (Kitty/iTerm2 protocols)** - Full parity with TS terminal-image.ts:
+  - `terminal_image.rs`: Terminal capability detection (Kitty, Ghostty, WezTerm, iTerm2, VSCode, Alacritty).
+  - Kitty graphics protocol: Single chunk and chunked (4096-byte) encoding with columns/rows parameters.
+  - iTerm2 inline images protocol: OSC 1337 encoding with width/height/name/aspect ratio options.
+  - Image dimension parsing: PNG (IHDR chunk), JPEG (SOF markers), GIF (header), WebP (VP8/VP8L/VP8X).
+  - Row calculation: Scales image to target width cells with configurable cell dimensions.
+  - Image component: TUI component with fallback text for unsupported terminals.
+  - **Tests ported from TS**: `tests/tui_terminal_image_test.rs` covers Kitty/iTerm2 encoding, dimension parsing for all formats, row calculation, and fallback text (matching `image-test.ts`).
 
 ## Remaining Gaps (Next)
-- Interactive TUI parity: inline images (Kitty/iTerm2), selectors/keybindings, tool output expansion, session tree UX, theme reload.
+- Interactive TUI parity: selectors/keybindings, tool output expansion, session tree UX, theme reload.
+- Wire Image component into interactive mode (rendering images in chat).
 - TS extensions support in the JS host (jiti-based loading) + parity tests.
 
 ## Test Plan

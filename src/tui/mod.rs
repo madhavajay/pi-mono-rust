@@ -1,11 +1,18 @@
 pub mod autocomplete;
 pub mod components;
+pub mod terminal_image;
 pub mod utils;
 
 pub use autocomplete::{AutocompleteItem, AutocompleteSuggestions, CombinedAutocompleteProvider};
 pub use components::{
-    Component, Container, DefaultTextStyle, Editor, EditorTheme, Markdown, MarkdownTheme, Spacer,
-    Text, TruncatedText,
+    Component, Container, DefaultTextStyle, Editor, EditorTheme, Image, ImageOptions, ImageTheme,
+    Markdown, MarkdownTheme, Spacer, Text, TruncatedText,
+};
+pub use terminal_image::{
+    calculate_image_rows, encode_iterm2, encode_kitty, get_capabilities, get_cell_dimensions,
+    get_gif_dimensions, get_image_dimensions, get_jpeg_dimensions, get_png_dimensions,
+    get_webp_dimensions, image_fallback, render_image, set_cell_dimensions, CellDimensions,
+    ImageDimensions, ImageProtocol, ImageRenderOptions, ImageRenderResult, TerminalCapabilities,
 };
 pub use utils::{
     apply_background_to_line, is_punctuation_char, is_whitespace_char, truncate_to_width,

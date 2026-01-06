@@ -1,6 +1,7 @@
 mod component;
 mod container;
 mod editor;
+mod image;
 mod markdown;
 mod spacer;
 mod text;
@@ -9,6 +10,7 @@ mod truncated_text;
 pub use component::Component;
 pub use container::Container;
 pub use editor::{Editor, EditorTheme};
+pub use image::{Image, ImageOptions, ImageTheme};
 pub use markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 pub use spacer::Spacer;
 pub use text::Text;
