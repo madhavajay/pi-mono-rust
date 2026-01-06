@@ -170,6 +170,7 @@ Planned modules (initial, not final):
   - Stream module: JWT decoding for account ID, SSE parsing, event emission for reasoning/text/tool calls.
   - Integration with session.rs for `openai-codex-responses` API type.
   - Auth module extended with `resolve_openai_codex_credentials` for separate Codex OAuth tokens.
+  - **Tests ported from TS**: `tests/openai_codex_test.rs` covers request transformation, model normalization, error parsing, include handling, and SSE parsing (matching `openai-codex.test.ts`, `openai-codex-include.test.ts`, `openai-codex-stream.test.ts`).
 
 ## Remaining Gaps (Next)
 - Interactive TUI parity: inline images (Kitty/iTerm2), selectors/keybindings, tool output expansion, session tree UX, theme reload.
