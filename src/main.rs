@@ -6,8 +6,9 @@ use pi::cli::args::ThinkingLevel as CliThinkingLevel;
 use pi::cli::list_models::list_models;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
-    build_system_prompt, export_from_file, AgentSession, AgentSessionConfig, AuthCredential,
-    AuthStorage, BuildSystemPromptOptions, Model as RegistryModel, ModelRegistry, SettingsManager,
+    build_system_prompt, export_from_file, load_prompt_templates, AgentSession, AgentSessionConfig,
+    AuthCredential, AuthStorage, BuildSystemPromptOptions, LoadPromptTemplatesOptions,
+    Model as RegistryModel, ModelRegistry, SettingsManager,
 };
 use pi::core::messages::{
     AgentMessage as CoreAgentMessage, AssistantMessage, ContentBlock, Cost, ToolResultMessage,
@@ -2836,12 +2837,18 @@ fn create_cli_session(
 
     let settings_manager = SettingsManager::create("", "");
 
-    Ok(AgentSession::new(AgentSessionConfig {
+    let mut session = AgentSession::new(AgentSessionConfig {
         agent,
         session_manager,
         settings_manager,
         model_registry: registry,
-    }))
+    });
+    let templates = load_prompt_templates(LoadPromptTemplatesOptions {
+        cwd: Some(cwd),
+        agent_dir: get_agent_dir(),
+    });
+    session.set_prompt_templates(templates);
+    Ok(session)
 }
 
 fn create_rpc_session(
@@ -2905,12 +2912,18 @@ fn create_rpc_session(
 
     let settings_manager = SettingsManager::create("", "");
 
-    Ok(AgentSession::new(AgentSessionConfig {
+    let mut session = AgentSession::new(AgentSessionConfig {
         agent,
         session_manager,
         settings_manager,
         model_registry: registry,
-    }))
+    });
+    let templates = load_prompt_templates(LoadPromptTemplatesOptions {
+        cwd: Some(cwd),
+        agent_dir: get_agent_dir(),
+    });
+    session.set_prompt_templates(templates);
+    Ok(session)
 }
 
 fn build_anthropic_messages(context: &LlmContext) -> Vec<AnthropicMessage> {

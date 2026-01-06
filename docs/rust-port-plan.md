@@ -131,6 +131,7 @@ Planned modules (initial, not final):
 - Session default directory respects `PI_CODING_AGENT_DIR` for `sessions/`.
 - Bash tool now truncates tail output with temp file preservation when output exceeds limits.
 - System prompt builder now mirrors TS defaults (tools/guidelines, project context files, skills; `--skills`/`--no-skills`).
+- Prompt templates from `~/.pi/agent/prompts` and `.pi/prompts` are loaded and expanded for `/command` inputs.
 - HTML export now uses the TS template assets with the default dark theme and supports CLI `--export` + RPC `export_html`.
 - CLI `--thinking` sets the initial thinking level and persists it to the session.
 - Settings manager now loads `settings.json` (global + project override) for compaction/retry/theme defaults and persists global updates.

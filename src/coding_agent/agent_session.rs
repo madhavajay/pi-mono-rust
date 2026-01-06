@@ -3,6 +3,7 @@ use crate::coding_agent::export_html::export_session_to_html;
 use crate::coding_agent::hooks::{
     CompactionHook, CompactionResult, SessionBeforeCompactEvent, SessionCompactEvent,
 };
+use crate::coding_agent::prompt_templates::{expand_prompt_template, PromptTemplate};
 use crate::coding_agent::ModelRegistry;
 use crate::core::compaction::prepare_compaction;
 use crate::core::messages::{
@@ -40,6 +41,7 @@ pub struct AgentSession {
     pub session_manager: SessionManager,
     pub settings_manager: SettingsManager,
     pub model_registry: ModelRegistry,
+    prompt_templates: Vec<PromptTemplate>,
     branch_summary_aborted: Cell<bool>,
     compaction_hooks: Vec<CompactionHook>,
     listeners: Rc<RefCell<Vec<(usize, AgentSessionEventListener)>>>,
@@ -94,6 +96,7 @@ impl AgentSession {
             session_manager,
             settings_manager,
             model_registry,
+            prompt_templates: Vec::new(),
             branch_summary_aborted: Cell::new(false),
             compaction_hooks: Vec::new(),
             listeners,
@@ -144,6 +147,14 @@ impl AgentSession {
         self.agent.state().messages
     }
 
+    pub fn set_prompt_templates(&mut self, templates: Vec<PromptTemplate>) {
+        self.prompt_templates = templates;
+    }
+
+    pub fn prompt_templates(&self) -> &[PromptTemplate] {
+        &self.prompt_templates
+    }
+
     pub fn pending_message_count(&self) -> usize {
         self.agent.pending_steering_count() + self.agent.pending_follow_up_count()
     }
@@ -154,7 +165,10 @@ impl AgentSession {
         }
 
         let before_len = self.agent.state().messages.len();
-        self.agent.prompt(text).map_err(AgentSessionError::Agent)?;
+        let expanded_text = self.expand_prompt_text(text);
+        self.agent
+            .prompt(expanded_text.as_str())
+            .map_err(AgentSessionError::Agent)?;
         let messages = self.agent.state().messages;
         for message in messages.into_iter().skip(before_len) {
             if let Some(core_message) = convert_message(&message) {
@@ -170,6 +184,7 @@ impl AgentSession {
         }
 
         let before_len = self.agent.state().messages.len();
+        let content = self.expand_user_content(content);
         let message = AgentMessage::User(UserMessage {
             content,
             timestamp: now_millis(),
@@ -187,17 +202,47 @@ impl AgentSession {
     }
 
     pub fn steer(&self, text: &str) {
+        let expanded_text = self.expand_prompt_text(text);
         self.agent.steer(AgentMessage::User(UserMessage {
-            content: UserContent::Text(text.to_string()),
+            content: UserContent::Text(expanded_text),
             timestamp: now_millis(),
         }));
     }
 
     pub fn follow_up(&self, text: &str) {
+        let expanded_text = self.expand_prompt_text(text);
         self.agent.follow_up(AgentMessage::User(UserMessage {
-            content: UserContent::Text(text.to_string()),
+            content: UserContent::Text(expanded_text),
             timestamp: now_millis(),
         }));
+    }
+
+    fn expand_prompt_text(&self, text: &str) -> String {
+        if self.prompt_templates.is_empty() {
+            return text.to_string();
+        }
+        expand_prompt_template(text, &self.prompt_templates)
+    }
+
+    fn expand_user_content(&self, content: UserContent) -> UserContent {
+        match content {
+            UserContent::Text(text) => UserContent::Text(self.expand_prompt_text(&text)),
+            UserContent::Blocks(mut blocks) => {
+                let mut expanded = false;
+                for block in &mut blocks {
+                    if expanded {
+                        break;
+                    }
+                    if let ContentBlock::Text { text, .. } = block {
+                        if text.starts_with('/') {
+                            *text = self.expand_prompt_text(text);
+                        }
+                        expanded = true;
+                    }
+                }
+                UserContent::Blocks(blocks)
+            }
+        }
     }
 
     pub fn abort(&self) {
