@@ -1476,8 +1476,10 @@ fn main() {
             eprintln!("Error: @file arguments are not supported in RPC mode.");
             process::exit(1);
         }
-        if model.api != "anthropic-messages" {
-            eprintln!("Error: RPC mode currently supports only \"anthropic-messages\" models.");
+        if model.api != "anthropic-messages" && model.api != "openai-responses" {
+            eprintln!(
+                "Error: RPC mode currently supports only \"anthropic-messages\" and \"openai-responses\" models."
+            );
             process::exit(1);
         }
         let mut session = match create_rpc_session(
@@ -2686,32 +2688,6 @@ fn tool_result_to_agent_result(result: agent_tools::ToolResult) -> AgentToolResu
     }
 }
 
-fn build_anthropic_tool_specs(tool_names: Option<&[String]>) -> Result<Vec<AnthropicTool>, String> {
-    let mut tool_defs = default_tools();
-    if let Some(tool_names) = tool_names {
-        let missing = tool_names
-            .iter()
-            .filter(|name| !tool_defs.iter().any(|tool| tool.name == name.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!(
-                "Tool(s) not implemented yet: {}",
-                missing.join(", ")
-            ));
-        }
-        tool_defs.retain(|tool| tool_names.iter().any(|name| name == tool.name));
-    }
-    Ok(tool_defs
-        .into_iter()
-        .map(|tool| AnthropicTool {
-            name: tool.name.to_string(),
-            description: tool.description.to_string(),
-            input_schema: tool.input_schema,
-        })
-        .collect())
-}
-
 fn build_stream_fn(
     model: RegistryModel,
     api_key: String,
@@ -2877,11 +2853,42 @@ fn create_rpc_session(
     api_key_override: Option<&str>,
     session_manager: SessionManager,
 ) -> Result<AgentSession, String> {
-    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
-    let tool_specs = build_anthropic_tool_specs(tool_names)?;
-    let stream_fn = build_stream_fn(model.clone(), api_key, use_oauth, tool_specs);
     let cwd = env::current_dir().map_err(|err| err.to_string())?;
     let agent_tools = build_agent_tools(&cwd, tool_names)?;
+    let tool_defs = build_tool_defs(tool_names)?;
+    let stream_fn = match model.api.as_str() {
+        "anthropic-messages" => {
+            let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| AnthropicTool {
+                    name: tool.name.to_string(),
+                    description: tool.description.to_string(),
+                    input_schema: tool.input_schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            build_stream_fn(model.clone(), api_key, use_oauth, tool_specs)
+        }
+        "openai-responses" => {
+            let api_key = resolve_openai_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| OpenAITool {
+                    tool_type: "function".to_string(),
+                    name: tool.name.to_string(),
+                    description: tool.description.to_string(),
+                    parameters: tool.input_schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            build_openai_stream_fn(model.clone(), api_key, tool_specs)
+        }
+        _ => {
+            return Err(format!(
+                "Model API \"{}\" is not supported in RPC mode.",
+                model.api
+            ))
+        }
+    };
 
     let system_value = merge_system_prompt(system_prompt, append_system_prompt).unwrap_or_default();
     let agent_model = to_agent_model(&model);
