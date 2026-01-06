@@ -199,6 +199,15 @@ async function emitEvent(extensions, event, context) {
             return { result, errors };
           }
         }
+        if (event.type === "tool_call" && handlerResult) {
+          result = handlerResult;
+          if (result.block) {
+            return { result, errors };
+          }
+        }
+        if (event.type === "tool_result" && handlerResult) {
+          result = handlerResult;
+        }
       } catch (err) {
         errors.push({
           extensionPath: ext.path,

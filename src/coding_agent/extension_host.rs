@@ -2,7 +2,7 @@ use crate::coding_agent::hooks::{
     CompactionResult, SessionBeforeCompactEvent, SessionBeforeCompactResult, SessionCompactEvent,
 };
 use crate::core::compaction::{CompactionPreparation, CompactionSettings, FileOperations};
-use crate::core::messages::AgentMessage;
+use crate::core::messages::{AgentMessage, ContentBlock};
 use crate::core::session_manager::SessionEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -150,6 +150,18 @@ struct ExtensionEventPayload<'a> {
     compaction_entry: Option<&'a crate::core::session_manager::CompactionEntry>,
     from_extension: Option<bool>,
     messages: Option<&'a [AgentMessage]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a [ContentBlock]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -194,6 +206,21 @@ struct ExtensionCompactionResult {
 struct ExtensionBeforeCompactResult {
     cancel: Option<bool>,
     compaction: Option<ExtensionCompactionResult>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionToolCallResult {
+    pub block: Option<bool>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionToolResult {
+    pub content: Option<Vec<ContentBlock>>,
+    pub details: Option<Value>,
+    pub is_error: Option<bool>,
 }
 
 pub struct ExtensionHost {
@@ -287,6 +314,12 @@ impl ExtensionHost {
             compaction_entry: None,
             from_extension: None,
             messages: None,
+            tool_name: None,
+            tool_call_id: None,
+            input: None,
+            content: None,
+            details: None,
+            is_error: None,
         };
         let context = self.build_context(&event.branch_entries);
         let response = self.emit_event(&payload, context)?;
@@ -312,6 +345,12 @@ impl ExtensionHost {
             compaction_entry: Some(&event.compaction_entry),
             from_extension: Some(event.from_hook),
             messages: None,
+            tool_name: None,
+            tool_call_id: None,
+            input: None,
+            content: None,
+            details: None,
+            is_error: None,
         };
         let context = self.build_context(&[]);
         let response = self.emit_event(&payload, context)?;
@@ -334,6 +373,12 @@ impl ExtensionHost {
             compaction_entry: None,
             from_extension: None,
             messages: Some(messages),
+            tool_name: None,
+            tool_call_id: None,
+            input: None,
+            content: None,
+            details: None,
+            is_error: None,
         };
         let context = self.build_context(&[]);
         let response = self.emit_event(&payload, context)?;
@@ -343,6 +388,85 @@ impl ExtensionHost {
                 .unwrap_or_else(|| "Extension host emit failed".to_string()));
         }
         Ok(response.errors.unwrap_or_default())
+    }
+
+    pub fn emit_tool_call(
+        &mut self,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: &Value,
+    ) -> Result<ExtensionToolCallResult, String> {
+        let payload = ExtensionEventPayload {
+            kind: "tool_call",
+            preparation: None,
+            branch_entries: None,
+            compaction_entry: None,
+            from_extension: None,
+            messages: None,
+            tool_name: Some(tool_name),
+            tool_call_id: Some(tool_call_id),
+            input: Some(input),
+            content: None,
+            details: None,
+            is_error: None,
+        };
+        let context = self.build_context(&[]);
+        let response = self.emit_event(&payload, context)?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "Extension host emit failed".to_string()));
+        }
+        if let Some(errors) = response.errors.as_deref() {
+            report_extension_errors(errors);
+        }
+        let result = match response.result {
+            Some(Value::Null) | None => ExtensionToolCallResult::default(),
+            Some(value) => serde_json::from_value::<ExtensionToolCallResult>(value)
+                .map_err(|err| format!("Failed to parse extension result: {err}"))?,
+        };
+        Ok(result)
+    }
+
+    pub fn emit_tool_result(
+        &mut self,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: &Value,
+        content: &[ContentBlock],
+        details: &Value,
+        is_error: bool,
+    ) -> Result<ExtensionToolResult, String> {
+        let payload = ExtensionEventPayload {
+            kind: "tool_result",
+            preparation: None,
+            branch_entries: None,
+            compaction_entry: None,
+            from_extension: None,
+            messages: None,
+            tool_name: Some(tool_name),
+            tool_call_id: Some(tool_call_id),
+            input: Some(input),
+            content: Some(content),
+            details: Some(details),
+            is_error: Some(is_error),
+        };
+        let context = self.build_context(&[]);
+        let response = self.emit_event(&payload, context)?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "Extension host emit failed".to_string()));
+        }
+        if let Some(errors) = response.errors.as_deref() {
+            report_extension_errors(errors);
+        }
+        let result = match response.result {
+            Some(Value::Null) | None => ExtensionToolResult::default(),
+            Some(value) => serde_json::from_value::<ExtensionToolResult>(value)
+                .map_err(|err| format!("Failed to parse extension result: {err}"))?,
+        };
+        Ok(result)
     }
 
     pub fn set_flag_values(&mut self, flags: &HashMap<String, Value>) -> Result<(), String> {
@@ -415,6 +539,22 @@ impl ExtensionHost {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+}
+
+fn report_extension_errors(errors: &[ExtensionHostError]) {
+    for error in errors {
+        if let Some(event) = error.event.as_deref() {
+            eprintln!(
+                "Warning: Extension error in {} ({}): {}",
+                event, error.extension_path, error.error
+            );
+        } else {
+            eprintln!(
+                "Warning: Extension error ({}): {}",
+                error.extension_path, error.error
+            );
+        }
     }
 }
 

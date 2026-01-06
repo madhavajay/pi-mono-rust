@@ -1,4 +1,7 @@
-use crate::agent::{Agent, AgentError, AgentEvent, AgentMessage, CustomMessage, ThinkingLevel};
+use crate::agent::{
+    Agent, AgentError, AgentEvent, AgentMessage, AgentTool, AgentToolResult, CustomMessage,
+    ThinkingLevel,
+};
 use crate::coding_agent::export_html::export_session_to_html;
 use crate::coding_agent::extension_host::ExtensionHost;
 use crate::coding_agent::hooks::{
@@ -47,6 +50,7 @@ pub struct AgentSession {
     branch_summary_aborted: Cell<bool>,
     compaction_hooks: Vec<CompactionHook>,
     extension_host: Option<Rc<RefCell<ExtensionHost>>>,
+    tools_wrapped_with_extensions: bool,
     listeners: Rc<RefCell<Vec<(usize, AgentSessionEventListener)>>>,
     next_listener_id: Rc<RefCell<usize>>,
     unsubscribe_agent: Option<Box<dyn FnOnce()>>,
@@ -103,6 +107,7 @@ impl AgentSession {
             branch_summary_aborted: Cell::new(false),
             compaction_hooks: Vec::new(),
             extension_host: None,
+            tools_wrapped_with_extensions: false,
             listeners,
             next_listener_id,
             unsubscribe_agent: Some(Box::new(unsubscribe)),
@@ -296,6 +301,23 @@ impl AgentSession {
         );
         self.compaction_hooks.push(hook);
         self.extension_host = Some(host);
+        self.wrap_tools_with_extensions();
+    }
+
+    fn wrap_tools_with_extensions(&mut self) {
+        if self.tools_wrapped_with_extensions {
+            return;
+        }
+        let Some(host) = self.extension_host.clone() else {
+            return;
+        };
+        let tools = self.agent.state().tools;
+        if tools.is_empty() {
+            return;
+        }
+        let wrapped = wrap_tools_with_extension_host(tools, host);
+        self.agent.set_tools(wrapped);
+        self.tools_wrapped_with_extensions = true;
     }
 
     pub fn abort_branch_summary(&self) {
@@ -1833,6 +1855,84 @@ fn summarize_compaction_messages(messages: &[CoreAgentMessage]) -> String {
 
     let merged = parts.join(" ");
     format!("Summary: {}", clip_words(&merged, 32))
+}
+
+fn wrap_tools_with_extension_host(
+    tools: Vec<AgentTool>,
+    host: Rc<RefCell<ExtensionHost>>,
+) -> Vec<AgentTool> {
+    tools
+        .into_iter()
+        .map(|tool| {
+            let tool_name = tool.name.clone();
+            let label = tool.label.clone();
+            let description = tool.description.clone();
+            let execute = tool.execute.clone();
+            let host_ref = host.clone();
+
+            AgentTool {
+                name: tool_name.clone(),
+                label,
+                description,
+                execute: Rc::new(move |tool_call_id, args| {
+                    let call_result = match host_ref
+                        .borrow_mut()
+                        .emit_tool_call(&tool_name, tool_call_id, args)
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            eprintln!("Warning: Extension tool_call failed: {err}");
+                            crate::coding_agent::extension_host::ExtensionToolCallResult::default()
+                        }
+                    };
+
+                    if call_result.block.unwrap_or(false) {
+                        let reason = call_result.reason.unwrap_or_else(|| {
+                            "Tool execution was blocked by an extension".to_string()
+                        });
+                        return Err(reason);
+                    }
+
+                    match (execute)(tool_call_id, args) {
+                        Ok(result) => {
+                            let override_result = match host_ref.borrow_mut().emit_tool_result(
+                                &tool_name,
+                                tool_call_id,
+                                args,
+                                &result.content,
+                                &result.details,
+                                false,
+                            ) {
+                                Ok(override_result) => override_result,
+                                Err(err) => {
+                                    eprintln!("Warning: Extension tool_result failed: {err}");
+                                    crate::coding_agent::extension_host::ExtensionToolResult::default()
+                                }
+                            };
+                            let content = override_result.content.unwrap_or(result.content);
+                            let details = override_result.details.unwrap_or(result.details);
+                            Ok(AgentToolResult { content, details })
+                        }
+                        Err(err) => {
+                            let error_content = vec![ContentBlock::Text {
+                                text: err.clone(),
+                                text_signature: None,
+                            }];
+                            let _ = host_ref.borrow_mut().emit_tool_result(
+                                &tool_name,
+                                tool_call_id,
+                                args,
+                                &error_content,
+                                &Value::Null,
+                                true,
+                            );
+                            Err(err)
+                        }
+                    }
+                }),
+            }
+        })
+        .collect()
 }
 
 fn now_millis() -> i64 {

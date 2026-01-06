@@ -145,6 +145,7 @@ Planned modules (initial, not final):
 - Extension discovery now scans global/project directories plus configured paths and hands JS/TS extensions to the host (TS uses `jiti` when available).
 - CLI now parses extension-defined flags and passes flag values into the JS extension host (`getFlag` supported).
 - Added a Rust-side extension runner for JS extension metadata (tools/commands/flags/shortcuts/renderers), shortcut conflict warnings, context event emit, and error listeners.
+- Extension tool_call/tool_result hooks now wrap built-in tools, allowing extensions to block or override tool outputs.
 
 ## Test Plan
 ### Baseline (TS)
