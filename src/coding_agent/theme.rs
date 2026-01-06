@@ -1,11 +1,15 @@
 use crate::config;
 use crate::tui::{EditorTheme, MarkdownTheme};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{OnceLock, RwLock};
+use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::thread;
+use std::time::Duration;
 
 const BUILTIN_DARK: &str = include_str!("../assets/themes/dark.json");
 const BUILTIN_LIGHT: &str = include_str!("../assets/themes/light.json");
@@ -565,6 +569,16 @@ fn fallback_theme() -> Theme {
 }
 
 static ACTIVE_THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
+static CURRENT_THEME_NAME: OnceLock<RwLock<String>> = OnceLock::new();
+static THEME_WATCHER: OnceLock<Mutex<Option<ThemeWatcher>>> = OnceLock::new();
+
+type ThemeChangeCallback = Box<dyn Fn() + Send + Sync>;
+static THEME_CHANGE_CALLBACK: OnceLock<Mutex<Option<ThemeChangeCallback>>> = OnceLock::new();
+
+struct ThemeWatcher {
+    _watcher: RecommendedWatcher,
+    stop_tx: mpsc::Sender<()>,
+}
 
 fn editor_border_color(text: &str) -> String {
     if let Some(lock) = ACTIVE_THEME.get() {
@@ -573,4 +587,200 @@ fn editor_border_color(text: &str) -> String {
         }
     }
     text.to_string()
+}
+
+/// Set the callback to be called when the theme file changes.
+pub fn on_theme_change<F: Fn() + Send + Sync + 'static>(callback: F) {
+    let lock = THEME_CHANGE_CALLBACK.get_or_init(|| Mutex::new(None));
+    *lock.lock().unwrap() = Some(Box::new(callback));
+}
+
+/// Start watching the current theme file for changes.
+/// Only watches custom themes (not built-in dark/light).
+pub fn start_theme_watcher() {
+    let current_name = {
+        let lock = CURRENT_THEME_NAME.get_or_init(|| RwLock::new("dark".to_string()));
+        lock.read().unwrap().clone()
+    };
+
+    // Only watch custom themes, not built-ins
+    if current_name == "dark" || current_name == "light" {
+        return;
+    }
+
+    let theme_path = custom_theme_path(&current_name);
+    if !theme_path.exists() {
+        return;
+    }
+
+    // Stop existing watcher
+    stop_theme_watcher();
+
+    let (stop_tx, stop_rx) = mpsc::channel();
+
+    // Create the notify watcher with a debounced event handler
+    let (event_tx, event_rx) = mpsc::channel();
+
+    let watcher_result = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
+        if let Ok(event) = res {
+            let _ = event_tx.send(event);
+        }
+    });
+
+    let Ok(mut watcher) = watcher_result else {
+        return;
+    };
+
+    // Watch the theme file
+    if watcher
+        .watch(&theme_path, RecursiveMode::NonRecursive)
+        .is_err()
+    {
+        return;
+    }
+
+    // Spawn a thread to handle events with debouncing
+    let theme_name = current_name.clone();
+    let path_clone = theme_path.clone();
+    thread::spawn(move || {
+        let debounce_duration = Duration::from_millis(100);
+        let mut last_event_time = std::time::Instant::now()
+            .checked_sub(debounce_duration)
+            .unwrap_or_else(std::time::Instant::now);
+
+        loop {
+            // Check for stop signal
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
+            // Check for file events with timeout
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => {
+                    // Only handle modify and remove events
+                    let should_handle = matches!(
+                        event.kind,
+                        EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Create(_)
+                    );
+
+                    if should_handle {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_event_time) >= debounce_duration {
+                            last_event_time = now;
+
+                            // Check if file was deleted
+                            if matches!(event.kind, EventKind::Remove(_)) || !path_clone.exists() {
+                                // Fall back to dark theme
+                                if let Ok(dark_theme) = load_theme(Some("dark")) {
+                                    set_active_theme(dark_theme);
+                                    {
+                                        let lock = CURRENT_THEME_NAME
+                                            .get_or_init(|| RwLock::new("dark".to_string()));
+                                        *lock.write().unwrap() = "dark".to_string();
+                                    }
+                                    // Notify callback
+                                    if let Some(lock) = THEME_CHANGE_CALLBACK.get() {
+                                        if let Ok(guard) = lock.lock() {
+                                            if let Some(callback) = guard.as_ref() {
+                                                callback();
+                                            }
+                                        }
+                                    }
+                                }
+                                // Stop watching since file is gone
+                                break;
+                            }
+
+                            // Try to reload the theme
+                            if let Ok(new_theme) = load_theme(Some(&theme_name)) {
+                                set_active_theme(new_theme);
+                                // Notify callback
+                                if let Some(lock) = THEME_CHANGE_CALLBACK.get() {
+                                    if let Ok(guard) = lock.lock() {
+                                        if let Some(callback) = guard.as_ref() {
+                                            callback();
+                                        }
+                                    }
+                                }
+                            }
+                            // If reload fails, silently ignore (file might be mid-edit)
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    let theme_watcher = ThemeWatcher {
+        _watcher: watcher,
+        stop_tx,
+    };
+
+    let lock = THEME_WATCHER.get_or_init(|| Mutex::new(None));
+    *lock.lock().unwrap() = Some(theme_watcher);
+}
+
+/// Stop watching the theme file.
+pub fn stop_theme_watcher() {
+    if let Some(lock) = THEME_WATCHER.get() {
+        let mut guard = lock.lock().unwrap();
+        if let Some(watcher) = guard.take() {
+            // Send stop signal
+            let _ = watcher.stop_tx.send(());
+        }
+    }
+}
+
+/// Set the theme and optionally enable the file watcher.
+/// Returns Ok(()) on success, or an error message if the theme is invalid.
+pub fn set_theme(name: &str, enable_watcher: bool) -> Result<(), String> {
+    let theme = load_theme(Some(name))?;
+
+    {
+        let lock = CURRENT_THEME_NAME.get_or_init(|| RwLock::new("dark".to_string()));
+        *lock.write().unwrap() = name.to_string();
+    }
+
+    set_active_theme(theme);
+
+    if enable_watcher {
+        start_theme_watcher();
+    }
+
+    Ok(())
+}
+
+/// Initialize the theme system with an optional theme name and watcher.
+pub fn init_theme(theme_name: Option<&str>, enable_watcher: bool) {
+    let name = theme_name.unwrap_or_else(|| default_theme_name());
+
+    {
+        let lock = CURRENT_THEME_NAME.get_or_init(|| RwLock::new("dark".to_string()));
+        *lock.write().unwrap() = name.to_string();
+    }
+
+    let theme = match load_theme(Some(name)) {
+        Ok(t) => t,
+        Err(_) => {
+            // Fall back to dark theme silently
+            let lock = CURRENT_THEME_NAME.get_or_init(|| RwLock::new("dark".to_string()));
+            *lock.write().unwrap() = "dark".to_string();
+            load_theme(Some("dark")).unwrap_or_else(|_| fallback_theme())
+        }
+    };
+
+    set_active_theme(theme);
+
+    if enable_watcher {
+        start_theme_watcher();
+    }
+}
+
+/// Get the currently active theme.
+pub fn get_active_theme() -> Option<Theme> {
+    ACTIVE_THEME
+        .get()
+        .and_then(|lock| lock.read().ok().map(|t| t.clone()))
 }

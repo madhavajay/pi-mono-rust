@@ -212,9 +212,17 @@ Planned modules (initial, not final):
   - Scroll indicator for long session lists.
   - Integrated into `cli/runtime.rs::select_resume_session()` with fallback to line-based UI.
   - Unit tests covering filtering, navigation, rendering, and component structure.
+- **Theme file watcher** - Full parity with TS theme.ts:
+  - `start_theme_watcher()` / `stop_theme_watcher()` for custom theme file monitoring.
+  - Only watches custom themes (not built-in dark/light).
+  - Debounced file change handling (100ms) to avoid rapid reloads during editing.
+  - Falls back to dark theme if watched file is deleted.
+  - `on_theme_change()` callback registration for UI invalidation.
+  - `init_theme()` and `set_theme()` with optional watcher enable.
+  - Uses `notify` crate for cross-platform file watching.
 
 ## Remaining Gaps (Next)
-- Interactive TUI parity: theme reload with file watcher, input component improvements.
+- Interactive TUI parity: input component improvements (cursor handling, etc).
 - TS extensions parity tests (jiti loading already works when jiti is available in project).
 
 ## Test Plan
