@@ -28,15 +28,16 @@ fn should_emit_events_with_agentmessage_types() {
         get_follow_up_messages: None,
     };
 
-    let mut stream_fn = |_model: &Model, _ctx: &LlmContext| {
-        create_assistant_message(
-            vec![ContentBlock::Text {
-                text: "Hi there!".to_string(),
-                text_signature: None,
-            }],
-            "stop",
-        )
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> =
+        Box::new(|_model: &Model, _ctx: &LlmContext, _events| {
+            create_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "Hi there!".to_string(),
+                    text_signature: None,
+                }],
+                "stop",
+            )
+        });
 
     let stream = agent_loop(vec![user_prompt], context, config, &mut stream_fn);
     let events = stream.events().to_vec();
@@ -88,15 +89,16 @@ fn should_handle_custom_message_types_via_converttollm() {
         get_follow_up_messages: None,
     };
 
-    let mut stream_fn = |_model: &Model, _ctx: &LlmContext| {
-        create_assistant_message(
-            vec![ContentBlock::Text {
-                text: "Response".to_string(),
-                text_signature: None,
-            }],
-            "stop",
-        )
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> =
+        Box::new(|_model: &Model, _ctx: &LlmContext, _events| {
+            create_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "Response".to_string(),
+                    text_signature: None,
+                }],
+                "stop",
+            )
+        });
 
     let stream = agent_loop(vec![user_prompt], context, config, &mut stream_fn);
 
@@ -168,15 +170,16 @@ fn should_apply_transformcontext_before_converttollm() {
         get_follow_up_messages: None,
     };
 
-    let mut stream_fn = |_model: &Model, _ctx: &LlmContext| {
-        create_assistant_message(
-            vec![ContentBlock::Text {
-                text: "Response".to_string(),
-                text_signature: None,
-            }],
-            "stop",
-        )
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> =
+        Box::new(|_model: &Model, _ctx: &LlmContext, _events| {
+            create_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "Response".to_string(),
+                    text_signature: None,
+                }],
+                "stop",
+            )
+        });
 
     let _stream = agent_loop(vec![user_prompt], context, config, &mut stream_fn);
 
@@ -227,30 +230,31 @@ fn should_handle_tool_calls_and_results() {
 
     let call_index = Rc::new(Cell::new(0));
     let call_index_ref = call_index.clone();
-    let mut stream_fn = move |_model: &Model, _ctx: &LlmContext| {
-        let index = call_index_ref.get();
-        let message = if index == 0 {
-            create_assistant_message(
-                vec![ContentBlock::ToolCall {
-                    id: "tool-1".to_string(),
-                    name: "echo".to_string(),
-                    arguments: json!({ "value": "hello" }),
-                    thought_signature: None,
-                }],
-                "toolUse",
-            )
-        } else {
-            create_assistant_message(
-                vec![ContentBlock::Text {
-                    text: "done".to_string(),
-                    text_signature: None,
-                }],
-                "stop",
-            )
-        };
-        call_index_ref.set(index + 1);
-        message
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> =
+        Box::new(move |_model: &Model, _ctx: &LlmContext, _events| {
+            let index = call_index_ref.get();
+            let message = if index == 0 {
+                create_assistant_message(
+                    vec![ContentBlock::ToolCall {
+                        id: "tool-1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({ "value": "hello" }),
+                        thought_signature: None,
+                    }],
+                    "toolUse",
+                )
+            } else {
+                create_assistant_message(
+                    vec![ContentBlock::Text {
+                        text: "done".to_string(),
+                        text_signature: None,
+                    }],
+                    "stop",
+                )
+            };
+            call_index_ref.set(index + 1);
+            message
+        });
 
     let stream = agent_loop(vec![user_prompt], context, config, &mut stream_fn);
 
@@ -329,45 +333,47 @@ fn should_inject_queued_messages_and_skip_remaining_tool_calls() {
 
     let call_index_ref = call_index.clone();
     let saw_interrupt_ref = saw_interrupt_in_context.clone();
-    let mut stream_fn = move |_model: &Model, ctx: &LlmContext| {
-        let index = call_index_ref.get();
-        if index == 1 {
-            let saw_interrupt = ctx
-                .messages
-                .iter()
-                .any(|message| message.user_text() == Some("interrupt"));
-            saw_interrupt_ref.set(saw_interrupt);
-        }
-        let message = if index == 0 {
-            create_assistant_message(
-                vec![
-                    ContentBlock::ToolCall {
-                        id: "tool-1".to_string(),
-                        name: "echo".to_string(),
-                        arguments: json!({ "value": "first" }),
-                        thought_signature: None,
-                    },
-                    ContentBlock::ToolCall {
-                        id: "tool-2".to_string(),
-                        name: "echo".to_string(),
-                        arguments: json!({ "value": "second" }),
-                        thought_signature: None,
-                    },
-                ],
-                "toolUse",
-            )
-        } else {
-            create_assistant_message(
-                vec![ContentBlock::Text {
-                    text: "done".to_string(),
-                    text_signature: None,
-                }],
-                "stop",
-            )
-        };
-        call_index_ref.set(index + 1);
-        message
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> = Box::new(
+        move |_model: &Model, ctx: &LlmContext, _events: &mut pi::agent::StreamEvents| {
+            let index = call_index_ref.get();
+            if index == 1 {
+                let saw_interrupt = ctx
+                    .messages
+                    .iter()
+                    .any(|message| message.user_text() == Some("interrupt"));
+                saw_interrupt_ref.set(saw_interrupt);
+            }
+            let message = if index == 0 {
+                create_assistant_message(
+                    vec![
+                        ContentBlock::ToolCall {
+                            id: "tool-1".to_string(),
+                            name: "echo".to_string(),
+                            arguments: json!({ "value": "first" }),
+                            thought_signature: None,
+                        },
+                        ContentBlock::ToolCall {
+                            id: "tool-2".to_string(),
+                            name: "echo".to_string(),
+                            arguments: json!({ "value": "second" }),
+                            thought_signature: None,
+                        },
+                    ],
+                    "toolUse",
+                )
+            } else {
+                create_assistant_message(
+                    vec![ContentBlock::Text {
+                        text: "done".to_string(),
+                        text_signature: None,
+                    }],
+                    "stop",
+                )
+            };
+            call_index_ref.set(index + 1);
+            message
+        },
+    );
 
     let stream = agent_loop(vec![user_prompt], context, config, &mut stream_fn);
 
@@ -415,15 +421,16 @@ fn should_throw_when_context_has_no_messages() {
         get_follow_up_messages: None,
     };
 
-    let mut stream_fn = |_model: &Model, _ctx: &LlmContext| {
-        create_assistant_message(
-            vec![ContentBlock::Text {
-                text: "Response".to_string(),
-                text_signature: None,
-            }],
-            "stop",
-        )
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> =
+        Box::new(|_model: &Model, _ctx: &LlmContext, _events| {
+            create_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "Response".to_string(),
+                    text_signature: None,
+                }],
+                "stop",
+            )
+        });
 
     let err = agent_loop_continue(context, config, &mut stream_fn).unwrap_err();
     assert_eq!(err.to_string(), "Cannot continue: no messages in context");
@@ -446,15 +453,16 @@ fn should_continue_from_existing_context_without_emitting_user_message_events() 
         get_follow_up_messages: None,
     };
 
-    let mut stream_fn = |_model: &Model, _ctx: &LlmContext| {
-        create_assistant_message(
-            vec![ContentBlock::Text {
-                text: "Response".to_string(),
-                text_signature: None,
-            }],
-            "stop",
-        )
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> =
+        Box::new(|_model: &Model, _ctx: &LlmContext, _events| {
+            create_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "Response".to_string(),
+                    text_signature: None,
+                }],
+                "stop",
+            )
+        });
 
     let stream = agent_loop_continue(context, config, &mut stream_fn).unwrap();
     let messages = stream.result().to_vec();
@@ -517,15 +525,16 @@ fn should_allow_custom_message_types_as_last_message_caller_responsibility() {
         get_follow_up_messages: None,
     };
 
-    let mut stream_fn = |_model: &Model, _ctx: &LlmContext| {
-        create_assistant_message(
-            vec![ContentBlock::Text {
-                text: "Response to hook".to_string(),
-                text_signature: None,
-            }],
-            "stop",
-        )
-    };
+    let mut stream_fn: Box<pi::agent::StreamFn> =
+        Box::new(|_model: &Model, _ctx: &LlmContext, _events| {
+            create_assistant_message(
+                vec![ContentBlock::Text {
+                    text: "Response to hook".to_string(),
+                    text_signature: None,
+                }],
+                "stop",
+            )
+        });
 
     let stream = agent_loop_continue(context, config, &mut stream_fn).unwrap();
     let messages = stream.result().to_vec();

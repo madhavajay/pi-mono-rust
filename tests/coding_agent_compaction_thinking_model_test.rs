@@ -1,6 +1,4 @@
-use pi::agent::{
-    get_model, Agent, AgentOptions, AgentStateOverride, LlmContext, Model, ThinkingLevel,
-};
+use pi::agent::{get_model, Agent, AgentOptions, AgentStateOverride, ThinkingLevel};
 use pi::coding_agent::{
     AgentSession, AgentSessionConfig, AuthStorage, ModelRegistry, SettingsManager,
 };
@@ -10,7 +8,7 @@ use std::path::PathBuf;
 
 // Source: packages/coding-agent/test/compaction-thinking-model.test.ts
 
-type StreamFn = Box<dyn FnMut(&Model, &LlmContext) -> AssistantMessage>;
+type StreamFn = Box<pi::agent::StreamFn>;
 
 fn make_assistant_message(text: &str) -> AssistantMessage {
     AssistantMessage {
@@ -43,7 +41,8 @@ fn make_assistant_message(text: &str) -> AssistantMessage {
 
 fn create_session(provider: &str, model_id: &str, thinking_level: ThinkingLevel) -> AgentSession {
     let model = get_model(provider, model_id);
-    let stream_fn: StreamFn = Box::new(move |_model, _context| make_assistant_message("ok"));
+    let stream_fn: StreamFn =
+        Box::new(move |_model, _context, _events| make_assistant_message("ok"));
 
     let agent = Agent::new(AgentOptions {
         initial_state: Some(AgentStateOverride {

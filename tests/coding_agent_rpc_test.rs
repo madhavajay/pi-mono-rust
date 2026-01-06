@@ -1,6 +1,5 @@
 use pi::agent::{
-    get_model, Agent, AgentMessage, AgentOptions, AgentStateOverride, LlmContext, Model,
-    ThinkingLevel,
+    get_model, Agent, AgentMessage, AgentOptions, AgentStateOverride, Model, ThinkingLevel,
 };
 use pi::coding_agent::{
     AgentSession, AgentSessionConfig, AuthStorage, ModelRegistry, SettingsManager,
@@ -14,7 +13,7 @@ use uuid::Uuid;
 
 // Source: packages/coding-agent/test/rpc.test.ts
 
-type StreamFn = Box<dyn FnMut(&Model, &LlmContext) -> AssistantMessage>;
+type StreamFn = Box<pi::agent::StreamFn>;
 type ConvertToLlmFn = Box<dyn FnMut(&[AgentMessage]) -> Vec<AgentMessage>>;
 
 fn make_assistant_message(text: &str) -> AssistantMessage {
@@ -55,7 +54,7 @@ fn create_temp_dir(prefix: &str) -> PathBuf {
 }
 
 fn build_session(persist: bool, temp_dir: Option<&Path>, model: Model) -> AgentSession {
-    let stream_fn: StreamFn = Box::new(move |_model, context| {
+    let stream_fn: StreamFn = Box::new(move |_model, context, _events| {
         let mut bash_output = None;
         for message in context.messages.iter().rev() {
             if let AgentMessage::Custom(custom) = message {

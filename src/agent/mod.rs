@@ -1,8 +1,10 @@
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::ai::AssistantMessageEvent;
 use crate::core::messages::{
     AssistantMessage, ContentBlock, ToolResultMessage, UserContent, UserMessage,
 };
@@ -108,7 +110,21 @@ pub struct LlmContext {
     pub messages: Vec<AgentMessage>,
 }
 
-pub type StreamFn = dyn FnMut(&Model, &LlmContext) -> AssistantMessage;
+pub struct StreamEvents {
+    handler: Box<dyn FnMut(AssistantMessageEvent)>,
+}
+
+impl StreamEvents {
+    pub fn new(handler: Box<dyn FnMut(AssistantMessageEvent)>) -> Self {
+        Self { handler }
+    }
+
+    pub fn emit(&mut self, event: AssistantMessageEvent) {
+        (self.handler)(event);
+    }
+}
+
+pub type StreamFn = dyn FnMut(&Model, &LlmContext, &mut StreamEvents) -> AssistantMessage;
 
 pub struct AgentLoopConfig {
     pub model: Model,
@@ -224,12 +240,15 @@ impl AgentStream {
     }
 }
 
-pub fn agent_loop(
+pub fn agent_loop<F>(
     prompts: Vec<AgentMessage>,
     mut context: AgentContext,
     mut config: AgentLoopConfig,
-    stream_fn: &mut StreamFn,
-) -> AgentStream {
+    stream_fn: &mut F,
+) -> AgentStream
+where
+    F: FnMut(&Model, &LlmContext, &mut StreamEvents) -> AssistantMessage,
+{
     let mut stream = AgentStream::new();
     let mut new_messages = prompts.clone();
     context.messages.extend(prompts.clone());
@@ -254,11 +273,14 @@ pub fn agent_loop(
     stream
 }
 
-pub fn agent_loop_continue(
+pub fn agent_loop_continue<F>(
     context: AgentContext,
     mut config: AgentLoopConfig,
-    stream_fn: &mut StreamFn,
-) -> Result<AgentStream, AgentLoopError> {
+    stream_fn: &mut F,
+) -> Result<AgentStream, AgentLoopError>
+where
+    F: FnMut(&Model, &LlmContext, &mut StreamEvents) -> AssistantMessage,
+{
     if context.messages.is_empty() {
         return Err(AgentLoopError::EmptyContext);
     }
@@ -285,13 +307,15 @@ pub fn agent_loop_continue(
     Ok(stream)
 }
 
-fn run_loop(
+fn run_loop<F>(
     current_context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
     config: &mut AgentLoopConfig,
-    stream_fn: &mut StreamFn,
+    stream_fn: &mut F,
     stream: &mut AgentStream,
-) {
+) where
+    F: FnMut(&Model, &LlmContext, &mut StreamEvents) -> AssistantMessage,
+{
     let mut first_turn = true;
     let mut pending_messages = config
         .get_steering_messages
@@ -397,12 +421,15 @@ fn run_loop(
     stream.end(new_messages.clone());
 }
 
-fn stream_assistant_response(
+fn stream_assistant_response<F>(
     context: &mut AgentContext,
     config: &mut AgentLoopConfig,
-    stream_fn: &mut StreamFn,
+    stream_fn: &mut F,
     stream: &mut AgentStream,
-) -> AssistantMessage {
+) -> AssistantMessage
+where
+    F: FnMut(&Model, &LlmContext, &mut StreamEvents) -> AssistantMessage,
+{
     let mut messages = context.messages.clone();
     if let Some(transform) = config.transform_context.as_mut() {
         messages = transform(&messages);
@@ -414,17 +441,78 @@ fn stream_assistant_response(
         messages: llm_messages,
     };
 
-    let message = stream_fn(&config.model, &llm_context);
+    let saw_event = Rc::new(Cell::new(false));
+    let started = Rc::new(Cell::new(false));
+    let last_partial: Rc<RefCell<Option<AssistantMessage>>> = Rc::new(RefCell::new(None));
+    let stream_ptr: *mut AgentStream = stream as *mut _;
+    let saw_event_ref = saw_event.clone();
+    let started_ref = started.clone();
+    let last_partial_ref = last_partial.clone();
+
+    let handle_event = move |event: AssistantMessageEvent| {
+        saw_event_ref.set(true);
+        let partial = match event {
+            AssistantMessageEvent::Start { partial }
+            | AssistantMessageEvent::TextStart { partial, .. }
+            | AssistantMessageEvent::TextDelta { partial, .. }
+            | AssistantMessageEvent::TextEnd { partial, .. }
+            | AssistantMessageEvent::ThinkingStart { partial, .. }
+            | AssistantMessageEvent::ThinkingDelta { partial, .. }
+            | AssistantMessageEvent::ThinkingEnd { partial, .. }
+            | AssistantMessageEvent::ToolCallStart { partial, .. }
+            | AssistantMessageEvent::ToolCallDelta { partial, .. }
+            | AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
+            AssistantMessageEvent::Done { message } | AssistantMessageEvent::Error { message } => {
+                last_partial_ref.replace(Some(message));
+                None
+            }
+        };
+
+        let Some(partial) = partial else {
+            return;
+        };
+
+        last_partial_ref.replace(Some(partial.clone()));
+        let agent_message = AgentMessage::Assistant(partial.clone());
+        unsafe {
+            let stream = &mut *stream_ptr;
+            if !started_ref.get() {
+                started_ref.set(true);
+                stream.push(AgentEvent::MessageStart {
+                    message: agent_message.clone(),
+                });
+            }
+            stream.push(AgentEvent::MessageUpdate {
+                message: agent_message,
+            });
+        }
+    };
+
+    let mut stream_events = StreamEvents::new(Box::new(handle_event));
+    let message = stream_fn(&config.model, &llm_context, &mut stream_events);
     context
         .messages
         .push(AgentMessage::Assistant(message.clone()));
 
-    stream.push(AgentEvent::MessageStart {
-        message: AgentMessage::Assistant(message.clone()),
-    });
-    stream.push(AgentEvent::MessageUpdate {
-        message: AgentMessage::Assistant(message.clone()),
-    });
+    if !saw_event.get() {
+        stream.push(AgentEvent::MessageStart {
+            message: AgentMessage::Assistant(message.clone()),
+        });
+        stream.push(AgentEvent::MessageUpdate {
+            message: AgentMessage::Assistant(message.clone()),
+        });
+    } else if !started.get() {
+        let partial = last_partial
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| message.clone());
+        stream.push(AgentEvent::MessageStart {
+            message: AgentMessage::Assistant(partial.clone()),
+        });
+        stream.push(AgentEvent::MessageUpdate {
+            message: AgentMessage::Assistant(partial),
+        });
+    }
     stream.push(AgentEvent::MessageEnd {
         message: AgentMessage::Assistant(message.clone()),
     });

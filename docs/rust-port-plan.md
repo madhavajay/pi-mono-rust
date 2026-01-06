@@ -151,7 +151,13 @@ Planned modules (initial, not final):
 - Extension tool_call/tool_result hooks now wrap built-in tools, allowing extensions to block or override tool outputs.
 - Extension-registered tools now expose parameter schemas, are included in API tool specs, and execute via the JS extension host.
 - RPC mode now forwards extension UI requests/responses (select/confirm/input/editor + notify/status/widget/title/editor text) through the JS extension host.
+- Interactive mode now supports `/export` and `/compact` (with custom instructions) in the basic TUI.
+- RPC `compact` now accepts custom instructions like the TS implementation.
 - Theme JSON loading is available for interactive mode (built-in + custom theme directories), with editor border styling wired to theme colors.
+- Interactive mode now supports `/share` via GitHub gists (`gh` CLI) with shareable preview URLs.
+- Interactive mode now supports `/model`, `/settings`, `/changelog`, and `/hotkeys` in the basic TUI (line-based flow).
+- CLI refactor: extracted RPC handlers, API wrappers, and mode runners into dedicated modules; main.rs is now slim.
+- Streaming now uses SSE parsing for Anthropic/OpenAI Responses and emits incremental agent events.
 
 ## Test Plan
 ### Baseline (TS)

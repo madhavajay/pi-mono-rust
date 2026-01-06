@@ -1,4 +1,4 @@
-use pi::agent::{get_model, Agent, AgentOptions, AgentStateOverride, LlmContext, Model};
+use pi::agent::{get_model, Agent, AgentOptions, AgentStateOverride};
 use pi::coding_agent::{
     AgentSession, AgentSessionConfig, AuthStorage, ModelRegistry, SettingsManager,
 };
@@ -6,7 +6,7 @@ use pi::core::messages::{AssistantMessage, ContentBlock, Cost, Usage};
 use pi::core::session_manager::SessionManager;
 use std::path::PathBuf;
 
-type StreamFn = Box<dyn FnMut(&Model, &LlmContext) -> AssistantMessage>;
+type StreamFn = Box<pi::agent::StreamFn>;
 
 fn make_assistant_message(text: &str, stop_reason: &str) -> AssistantMessage {
     AssistantMessage {
@@ -39,7 +39,7 @@ fn make_assistant_message(text: &str, stop_reason: &str) -> AssistantMessage {
 
 fn create_session(streaming: bool) -> AgentSession {
     let model = get_model("anthropic", "claude-sonnet-4-5");
-    let stream_fn: StreamFn = Box::new(move |_model, _context| {
+    let stream_fn: StreamFn = Box::new(move |_model, _context, _events| {
         if streaming {
             make_assistant_message("", "streaming")
         } else {

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 // Source: packages/agent/test/e2e.test.ts
 
-type StreamFn = dyn FnMut(&Model, &LlmContext) -> AssistantMessage;
+type StreamFn = pi::agent::StreamFn;
 
 #[test]
 fn should_handle_basic_text_prompt() {
@@ -114,12 +114,14 @@ fn should_handle_abort_during_execution() {
     let model = get_model("mock", "test-model");
     let agent_holder: Rc<RefCell<Option<Rc<Agent>>>> = Rc::new(RefCell::new(None));
     let holder_ref = agent_holder.clone();
-    let stream_fn = Box::new(move |_model: &Model, context: &LlmContext| {
-        if let Some(agent) = holder_ref.borrow().as_ref() {
-            agent.abort();
-        }
-        respond_for_context(context)
-    });
+    let stream_fn: Box<pi::agent::StreamFn> = Box::new(
+        move |_model: &Model, context: &LlmContext, _events: &mut pi::agent::StreamEvents| {
+            if let Some(agent) = holder_ref.borrow().as_ref() {
+                agent.abort();
+            }
+            respond_for_context(context)
+        },
+    );
 
     let agent = Rc::new(Agent::new(AgentOptions {
         initial_state: Some(AgentStateOverride {
@@ -388,7 +390,7 @@ fn should_continue_and_process_tool_results() {
 }
 
 fn mock_stream_fn() -> Box<StreamFn> {
-    Box::new(move |_model, context| respond_for_context(context))
+    Box::new(move |_model, context, _events| respond_for_context(context))
 }
 
 fn respond_for_context(context: &LlmContext) -> AssistantMessage {

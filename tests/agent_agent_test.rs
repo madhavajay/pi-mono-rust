@@ -151,7 +151,7 @@ fn should_handle_abort_controller() {
 #[test]
 fn should_throw_when_prompt_called_while_streaming() {
     let agent = Agent::new(AgentOptions {
-        stream_fn: Some(Box::new(|_model, _ctx| streaming_message())),
+        stream_fn: Some(Box::new(|_model, _ctx, _events| streaming_message())),
         ..AgentOptions::default()
     });
 
@@ -168,7 +168,7 @@ fn should_throw_when_prompt_called_while_streaming() {
 #[test]
 fn should_throw_when_continue_called_while_streaming() {
     let agent = Agent::new(AgentOptions {
-        stream_fn: Some(Box::new(|_model, _ctx| streaming_message())),
+        stream_fn: Some(Box::new(|_model, _ctx, _events| streaming_message())),
         ..AgentOptions::default()
     });
 

@@ -1,4 +1,4 @@
-use pi::agent::{get_model, Agent, AgentOptions, AgentStateOverride, LlmContext, Model};
+use pi::agent::{get_model, Agent, AgentOptions, AgentStateOverride};
 use pi::coding_agent::{
     AgentSession, AgentSessionConfig, AgentSessionEvent, AuthStorage, ModelRegistry,
     SettingsManager, SettingsOverrides,
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 // Source: packages/coding-agent/test/agent-session-compaction.test.ts
 
-type StreamFn = Box<dyn FnMut(&Model, &LlmContext) -> AssistantMessage>;
+type StreamFn = Box<pi::agent::StreamFn>;
 
 fn make_assistant_message(text: &str) -> AssistantMessage {
     AssistantMessage {
@@ -54,7 +54,8 @@ fn create_temp_dir(prefix: &str) -> PathBuf {
 
 fn create_session(persist: bool, temp_dir: Option<&Path>) -> AgentSession {
     let model = get_model("anthropic", "claude-sonnet-4-5");
-    let stream_fn: StreamFn = Box::new(move |_model, _context| make_assistant_message("ok"));
+    let stream_fn: StreamFn =
+        Box::new(move |_model, _context, _events| make_assistant_message("ok"));
 
     let agent = Agent::new(AgentOptions {
         initial_state: Some(AgentStateOverride {
@@ -111,6 +112,23 @@ fn should_trigger_manual_compaction_via_compact() {
     let messages = session.messages();
     assert!(!messages.is_empty());
     assert_eq!(messages[0].role(), "compactionSummary");
+
+    session.dispose();
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn should_include_custom_instructions_in_compaction_summary() {
+    let temp_dir = create_temp_dir("pi-compaction-test");
+    let mut session = create_session(true, Some(&temp_dir));
+
+    session.prompt("Say hello").unwrap();
+    session.prompt("Say goodbye").unwrap();
+
+    let result = session
+        .compact_with_instructions(Some("zebra-quokka memo"))
+        .unwrap();
+    assert!(result.summary.contains("zebra-quokka"));
 
     session.dispose();
     let _ = fs::remove_dir_all(&temp_dir);

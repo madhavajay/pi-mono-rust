@@ -1,4 +1,4 @@
-use pi::agent::{get_model, Agent, AgentOptions, AgentStateOverride, LlmContext, Model};
+use pi::agent::{get_model, Agent, AgentOptions, AgentStateOverride};
 use pi::coding_agent::{
     AgentSession, AgentSessionConfig, AuthStorage, ModelRegistry, NavigateTreeOptions,
     SettingsManager,
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 // Source: packages/coding-agent/test/agent-session-tree-navigation.test.ts
 
-type StreamFn = Box<dyn FnMut(&Model, &LlmContext) -> AssistantMessage>;
+type StreamFn = Box<pi::agent::StreamFn>;
 
 fn make_assistant_message(text: &str) -> AssistantMessage {
     AssistantMessage {
@@ -42,7 +42,8 @@ fn make_assistant_message(text: &str) -> AssistantMessage {
 
 fn create_session() -> AgentSession {
     let model = get_model("anthropic", "claude-sonnet-4-5");
-    let stream_fn: StreamFn = Box::new(move |_model, _context| make_assistant_message("ok"));
+    let stream_fn: StreamFn =
+        Box::new(move |_model, _context, _events| make_assistant_message("ok"));
 
     let agent = Agent::new(AgentOptions {
         initial_state: Some(AgentStateOverride {

@@ -7,8 +7,8 @@ use crate::core::messages::{AssistantMessage, ContentBlock, UserContent, UserMes
 
 use super::{
     agent_loop, agent_loop_continue, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage,
-    AgentTool, ConvertToLlmFn, CustomMessage, ListenerFn, LlmContext, Model, StreamFn,
-    TransformContextFn,
+    AgentTool, ConvertToLlmFn, CustomMessage, ListenerFn, LlmContext, Model, StreamEvents,
+    StreamFn, TransformContextFn,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -564,7 +564,11 @@ fn default_model() -> Model {
     }
 }
 
-fn default_stream_fn(_model: &Model, _context: &LlmContext) -> AssistantMessage {
+fn default_stream_fn(
+    _model: &Model,
+    _context: &LlmContext,
+    _events: &mut StreamEvents,
+) -> AssistantMessage {
     AssistantMessage {
         content: vec![ContentBlock::Text {
             text: String::new(),

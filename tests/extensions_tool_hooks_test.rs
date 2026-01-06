@@ -1,6 +1,5 @@
 use pi::agent::{
     get_model, Agent, AgentMessage, AgentOptions, AgentStateOverride, AgentTool, AgentToolResult,
-    LlmContext, Model,
 };
 use pi::coding_agent::{
     AgentSession, AgentSessionConfig, AuthStorage, ExtensionHost, ModelRegistry, SettingsManager,
@@ -11,7 +10,7 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-type StreamFn = dyn FnMut(&Model, &LlmContext) -> AssistantMessage;
+type StreamFn = pi::agent::StreamFn;
 
 struct TempDir {
     path: PathBuf,
@@ -94,7 +93,7 @@ fn tool_call_message(tool_name: &str) -> AssistantMessage {
 }
 
 fn tool_call_stream_fn(tool_name: &'static str) -> Box<StreamFn> {
-    Box::new(move |_model, context| {
+    Box::new(move |_model, context, _events| {
         let Some(last) = context.messages.last() else {
             return assistant_text_message("ok", "stop");
         };
