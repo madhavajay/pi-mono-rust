@@ -23,6 +23,8 @@ pub struct ExtensionTool {
     pub name: String,
     pub label: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -108,6 +110,19 @@ struct SetFlagsRequest<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     flags: &'a HashMap<String, Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InvokeToolRequest<'a> {
+    id: u64,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    name: &'a str,
+    #[serde(rename = "toolCallId")]
+    tool_call_id: &'a str,
+    input: &'a Value,
+    context: ExtensionContextPayload,
 }
 
 #[derive(Deserialize)]
@@ -208,6 +223,14 @@ struct ExtensionBeforeCompactResult {
     compaction: Option<ExtensionCompactionResult>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionToolInvokeResult {
+    content: Option<Vec<ContentBlock>>,
+    details: Option<Value>,
+    is_error: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionToolCallResult {
@@ -221,6 +244,12 @@ pub struct ExtensionToolResult {
     pub content: Option<Vec<ContentBlock>>,
     pub details: Option<Value>,
     pub is_error: Option<bool>,
+}
+
+pub struct ExtensionToolExecuteResult {
+    pub content: Vec<ContentBlock>,
+    pub details: Option<Value>,
+    pub is_error: bool,
 }
 
 pub struct ExtensionHost {
@@ -487,6 +516,31 @@ impl ExtensionHost {
         Ok(())
     }
 
+    pub fn call_tool(
+        &mut self,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: &Value,
+        session_entries: &[SessionEntry],
+    ) -> Result<ExtensionToolExecuteResult, String> {
+        let request = InvokeToolRequest {
+            id: self.next_id(),
+            kind: "invoke_tool",
+            name: tool_name,
+            tool_call_id,
+            input,
+            context: self.build_context(session_entries),
+        };
+        let response = self.send_request(request)?;
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "Extension tool invocation failed".to_string()));
+        }
+        let value = response.result.unwrap_or(Value::Null);
+        parse_tool_invoke_result(value)
+    }
+
     fn build_context(&self, session_entries: &[SessionEntry]) -> ExtensionContextPayload {
         ExtensionContextPayload {
             cwd: self.cwd.clone(),
@@ -619,4 +673,31 @@ fn convert_before_compact_result(
             tokens_before: compaction.tokens_before,
         }),
     }
+}
+
+fn parse_tool_invoke_result(value: Value) -> Result<ExtensionToolExecuteResult, String> {
+    if value.is_null() {
+        return Ok(ExtensionToolExecuteResult {
+            content: Vec::new(),
+            details: None,
+            is_error: false,
+        });
+    }
+    if let Some(text) = value.as_str() {
+        return Ok(ExtensionToolExecuteResult {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                text_signature: None,
+            }],
+            details: None,
+            is_error: false,
+        });
+    }
+    let parsed = serde_json::from_value::<ExtensionToolInvokeResult>(value)
+        .map_err(|err| format!("Failed to parse tool result: {err}"))?;
+    Ok(ExtensionToolExecuteResult {
+        content: parsed.content.unwrap_or_default(),
+        details: parsed.details,
+        is_error: parsed.is_error.unwrap_or(false),
+    })
 }

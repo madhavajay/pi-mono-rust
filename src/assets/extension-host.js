@@ -22,6 +22,14 @@ function createNoOpUI() {
   };
 }
 
+function createAbortSignal() {
+  return {
+    aborted: false,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+}
+
 function createExtensionApi(extensionPath, registry) {
   const handlers = registry.handlers;
   return {
@@ -37,7 +45,9 @@ function createExtensionApi(extensionPath, registry) {
           name: tool.name,
           label: tool.label,
           description: tool.description,
+          parameters: tool.parameters,
         });
+        registry.toolHandlers[tool.name] = tool;
       }
     },
     registerCommand(name, options) {
@@ -133,6 +143,7 @@ async function loadExtension(extensionPath) {
     path: extensionPath,
     handlers: {},
     tools: [],
+    toolHandlers: {},
     commands: [],
     flags: [],
     flagValues: {},
@@ -266,6 +277,10 @@ async function handleMessage(message, state) {
       }
     }
     state.extensions = extensions;
+    state.toolHandlers = Object.assign(
+      {},
+      ...extensions.map((ext) => ext.toolHandlers || {}),
+    );
     return {
       ok: true,
       extensions: sanitizeExtensions(extensions),
@@ -276,6 +291,29 @@ async function handleMessage(message, state) {
   if (message.type === "set_flags") {
     applyFlags(state.extensions, message.flags);
     return { ok: true };
+  }
+
+  if (message.type === "invoke_tool") {
+    const tool = state.toolHandlers[message.name];
+    if (!tool || typeof tool.execute !== "function") {
+      return { ok: false, error: `Tool ${message.name} not found` };
+    }
+    try {
+      const ctx = createContext(message.context);
+      const result = await tool.execute(
+        message.toolCallId,
+        message.input ?? {},
+        undefined,
+        ctx,
+        createAbortSignal(),
+      );
+      return { ok: true, result: result ?? null };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err && err.message ? err.message : String(err),
+      };
+    }
   }
 
   if (message.type === "emit") {
@@ -295,7 +333,7 @@ async function handleMessage(message, state) {
 }
 
 async function main() {
-  const state = { extensions: [] };
+  const state = { extensions: [], toolHandlers: {} };
   const rl = readline.createInterface({
     input: process.stdin,
     crlfDelay: Infinity,

@@ -146,6 +146,7 @@ Planned modules (initial, not final):
 - CLI now parses extension-defined flags and passes flag values into the JS extension host (`getFlag` supported).
 - Added a Rust-side extension runner for JS extension metadata (tools/commands/flags/shortcuts/renderers), shortcut conflict warnings, context event emit, and error listeners.
 - Extension tool_call/tool_result hooks now wrap built-in tools, allowing extensions to block or override tool outputs.
+- Extension-registered tools now expose parameter schemas, are included in API tool specs, and execute via the JS extension host.
 
 ## Test Plan
 ### Baseline (TS)

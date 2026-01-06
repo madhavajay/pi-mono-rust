@@ -10,6 +10,7 @@ pub struct RegisteredTool {
     pub name: String,
     pub label: Option<String>,
     pub description: Option<String>,
+    pub parameters: Option<Value>,
     pub extension_path: String,
 }
 
@@ -66,6 +67,7 @@ impl ExtensionRunner {
                 name: tool.name.clone(),
                 label: tool.label.clone(),
                 description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
                 extension_path: extension.path.clone(),
             }));
         }

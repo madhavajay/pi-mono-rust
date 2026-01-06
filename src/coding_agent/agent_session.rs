@@ -285,7 +285,10 @@ impl AgentSession {
     }
 
     pub fn set_extension_host(&mut self, host: ExtensionHost) {
-        let host = Rc::new(RefCell::new(host));
+        self.set_extension_host_shared(Rc::new(RefCell::new(host)));
+    }
+
+    pub fn set_extension_host_shared(&mut self, host: Rc<RefCell<ExtensionHost>>) {
         let before_host = host.clone();
         let after_host = host.clone();
         let hook = CompactionHook::new(

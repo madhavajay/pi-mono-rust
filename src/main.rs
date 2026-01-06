@@ -4,6 +4,7 @@ use pi::agent::{
 };
 use pi::cli::args::{ExtensionFlagType, ExtensionFlagValue, ThinkingLevel as CliThinkingLevel};
 use pi::cli::list_models::list_models;
+use pi::coding_agent::extension_host::ExtensionTool;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
     build_system_prompt, export_from_file, load_prompt_templates, AgentSession, AgentSessionConfig,
@@ -17,14 +18,15 @@ use pi::core::messages::{
     Usage, UserContent,
 };
 use pi::core::session_manager::{SessionInfo, SessionManager};
-use pi::tools::{default_tools, ToolDefinition};
+use pi::tools::default_tools;
 use pi::tui::{truncate_to_width, wrap_text_with_ansi, Editor, EditorTheme};
 use pi::{parse_args, Args, ListModels, Mode};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -132,6 +134,19 @@ struct OpenAICallOptions<'a> {
 struct FileInputImage {
     mime_type: String,
     data: String,
+}
+
+#[derive(Clone, Debug)]
+struct ToolSpec {
+    name: String,
+    description: String,
+    input_schema: Value,
+}
+
+#[derive(Clone)]
+struct PreloadedExtensions {
+    host: Rc<RefCell<ExtensionHost>>,
+    manifest: ExtensionManifest,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -828,12 +843,48 @@ fn call_openai(
         .map_err(|err| format!("Failed to parse response: {err}"))
 }
 
-fn build_tool_defs(tool_names: Option<&[String]>) -> Result<Vec<ToolDefinition>, String> {
-    let mut tool_defs = default_tools();
+fn build_tool_defs(
+    tool_names: Option<&[String]>,
+    extension_tools: &[ExtensionTool],
+) -> Result<Vec<ToolSpec>, String> {
+    let mut specs = Vec::new();
+    let default_defs = default_tools();
+    for tool in default_defs {
+        specs.push(ToolSpec {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+            input_schema: tool.input_schema.clone(),
+        });
+    }
+
+    for tool in extension_tools {
+        if specs.iter().any(|spec| spec.name == tool.name) {
+            eprintln!(
+                "Warning: Extension tool \"{}\" conflicts with built-in tool name. Skipping.",
+                tool.name
+            );
+            continue;
+        }
+        specs.push(ToolSpec {
+            name: tool.name.clone(),
+            description: tool
+                .description
+                .clone()
+                .unwrap_or_else(|| "Extension tool".to_string()),
+            input_schema: tool.parameters.clone().unwrap_or_else(|| {
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                })
+            }),
+        });
+    }
+
     if let Some(tool_names) = tool_names {
         let missing = tool_names
             .iter()
-            .filter(|name| !tool_defs.iter().any(|tool| tool.name == name.as_str()))
+            .filter(|name| !specs.iter().any(|tool| tool.name == name.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         if !missing.is_empty() {
@@ -842,9 +893,9 @@ fn build_tool_defs(tool_names: Option<&[String]>) -> Result<Vec<ToolDefinition>,
                 missing.join(", ")
             ));
         }
-        tool_defs.retain(|tool| tool_names.iter().any(|name| name == tool.name));
+        specs.retain(|tool| tool_names.iter().any(|name| name == &tool.name));
     }
-    Ok(tool_defs)
+    Ok(specs)
 }
 
 fn parse_openai_tool_arguments(arguments: &str) -> Value {
@@ -1634,7 +1685,7 @@ fn attach_extensions(session: &mut AgentSession, cwd: &Path) {
     match ExtensionHost::spawn(&discovered, cwd) {
         Ok((host, manifest)) => {
             report_extension_manifest(&manifest);
-            session.set_extension_host(host);
+            session.set_extension_host_shared(Rc::new(RefCell::new(host)));
         }
         Err(err) => {
             eprintln!("Warning: Failed to load extensions: {err}");
@@ -1645,14 +1696,23 @@ fn attach_extensions(session: &mut AgentSession, cwd: &Path) {
 fn attach_extensions_with_host(
     session: &mut AgentSession,
     cwd: &Path,
-    preloaded: Option<(ExtensionHost, ExtensionManifest)>,
+    preloaded: Option<PreloadedExtensions>,
 ) {
-    if let Some((host, manifest)) = preloaded {
+    if let Some(preloaded) = preloaded {
+        let PreloadedExtensions { host, manifest } = preloaded;
         report_extension_manifest(&manifest);
-        session.set_extension_host(host);
+        session.set_extension_host_shared(host);
         return;
     }
     attach_extensions(session, cwd);
+}
+
+fn collect_extension_tools(manifest: &ExtensionManifest) -> Vec<ExtensionTool> {
+    let mut tools = Vec::new();
+    for extension in &manifest.extensions {
+        tools.extend(extension.tools.clone());
+    }
+    tools
 }
 
 fn report_extension_manifest(manifest: &ExtensionManifest) {
@@ -1691,13 +1751,16 @@ fn main() {
         extension_paths.extend(paths.iter().cloned());
     }
     let discovered = discover_extension_paths(&extension_paths, &cwd, &config::get_agent_dir());
-    let mut preloaded_extension: Option<(ExtensionHost, ExtensionManifest)> = None;
+    let mut preloaded_extension: Option<PreloadedExtensions> = None;
     let mut extension_flag_types = HashMap::new();
     if !discovered.is_empty() {
         match ExtensionHost::spawn(&discovered, &cwd) {
             Ok((host, manifest)) => {
                 extension_flag_types = collect_extension_flags(&manifest);
-                preloaded_extension = Some((host, manifest));
+                preloaded_extension = Some(PreloadedExtensions {
+                    host: Rc::new(RefCell::new(host)),
+                    manifest,
+                });
             }
             Err(err) => {
                 eprintln!("Warning: Failed to load extensions: {err}");
@@ -1706,9 +1769,9 @@ fn main() {
     }
 
     let parsed = parse_args(&args, Some(&extension_flag_types));
-    if let Some((host, _)) = preloaded_extension.as_mut() {
+    if let Some(preloaded) = preloaded_extension.as_ref() {
         let flag_values = extension_flag_values_to_json(&parsed.extension_flags);
-        if let Err(err) = host.set_flag_values(&flag_values) {
+        if let Err(err) = preloaded.host.borrow_mut().set_flag_values(&flag_values) {
             eprintln!("Warning: Failed to apply extension flags: {err}");
         }
     }
@@ -1803,12 +1866,24 @@ fn main() {
         discover_system_prompt_file().map(|path| path.to_string_lossy().to_string())
     };
     let skill_patterns = parsed.skills.clone().unwrap_or_default();
-    let prompt_tools = parsed.tools.clone().unwrap_or_else(|| {
+    let extension_tools = preloaded_extension
+        .as_ref()
+        .map(|preloaded| collect_extension_tools(&preloaded.manifest))
+        .unwrap_or_default();
+    let extension_host = preloaded_extension
+        .as_ref()
+        .map(|preloaded| preloaded.host.clone());
+    let mut prompt_tools = parsed.tools.clone().unwrap_or_else(|| {
         default_tools()
             .iter()
             .map(|tool| tool.name.to_string())
             .collect()
     });
+    if parsed.tools.is_none() {
+        for tool in &extension_tools {
+            prompt_tools.push(tool.name.clone());
+        }
+    }
     let system_prompt = build_system_prompt(BuildSystemPromptOptions {
         custom_prompt: system_prompt_source,
         append_system_prompt: parsed.append_system_prompt.clone(),
@@ -1849,6 +1924,8 @@ fn main() {
             Some(system_prompt),
             None,
             parsed.tools.as_deref(),
+            &extension_tools,
+            extension_host.clone(),
             parsed.api_key.as_deref(),
             session_manager,
         ) {
@@ -1900,6 +1977,8 @@ fn main() {
         Some(system_prompt),
         None,
         parsed.tools.as_deref(),
+        &extension_tools,
+        extension_host.clone(),
         parsed.api_key.as_deref(),
         session_manager,
     ) {
@@ -2839,23 +2918,38 @@ fn to_agent_model(model: &RegistryModel) -> AgentModel {
 fn build_agent_tools(
     cwd: &PathBuf,
     tool_names: Option<&[String]>,
+    extension_tools: &[ExtensionTool],
+    extension_host: Option<Rc<RefCell<ExtensionHost>>>,
 ) -> Result<Vec<AgentTool>, String> {
     let available = ["read", "write", "edit", "bash", "grep", "find", "ls"];
+    let mut available_set = HashSet::new();
+    for name in available {
+        available_set.insert(name.to_string());
+    }
+    for tool in extension_tools {
+        available_set.insert(tool.name.clone());
+    }
+
     let selected = match tool_names {
         Some(names) => {
             for name in names {
-                if !available.iter().any(|item| item == name) {
+                if !available_set.contains(name) {
                     return Err(format!("Tool \"{name}\" is not supported"));
                 }
             }
             names.to_vec()
         }
-        None => available.iter().map(|name| name.to_string()).collect(),
+        None => available_set.into_iter().collect(),
     };
 
+    let selected_set = selected.iter().cloned().collect::<HashSet<_>>();
+
     let mut tools = Vec::new();
-    for name in selected {
-        match name.as_str() {
+    for name in available {
+        if !selected_set.contains(name) {
+            continue;
+        }
+        match name {
             "read" => {
                 let tool = agent_tools::ReadTool::new(cwd);
                 tools.push(AgentTool {
@@ -2949,6 +3043,57 @@ fn build_agent_tools(
             }
             _ => {}
         }
+    }
+
+    let Some(host) = extension_host else {
+        if extension_tools
+            .iter()
+            .any(|tool| selected_set.contains(&tool.name))
+        {
+            return Err(
+                "Extension tools requested but extension host is not available.".to_string(),
+            );
+        }
+        return Ok(tools);
+    };
+
+    for tool in extension_tools {
+        if !selected_set.contains(&tool.name) {
+            continue;
+        }
+        let tool_name = tool.name.clone();
+        let label = tool.label.clone().unwrap_or_else(|| tool.name.clone());
+        let description = tool
+            .description
+            .clone()
+            .unwrap_or_else(|| "Extension tool".to_string());
+        let host_ref = host.clone();
+
+        tools.push(AgentTool {
+            name: tool_name.clone(),
+            label,
+            description,
+            execute: Rc::new(move |call_id, params| {
+                let result = host_ref
+                    .borrow_mut()
+                    .call_tool(&tool_name, call_id, params, &[])?;
+                if result.is_error {
+                    let message = result
+                        .content
+                        .iter()
+                        .find_map(|block| match block {
+                            ContentBlock::Text { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "Extension tool failed".to_string());
+                    return Err(message);
+                }
+                Ok(AgentToolResult {
+                    content: result.content,
+                    details: result.details.unwrap_or(Value::Null),
+                })
+            }),
+        });
     }
 
     Ok(tools)
@@ -3143,18 +3288,21 @@ fn merge_system_prompt(
     system
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_cli_session(
     model: RegistryModel,
     registry: ModelRegistry,
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
     tool_names: Option<&[String]>,
+    extension_tools: &[ExtensionTool],
+    extension_host: Option<Rc<RefCell<ExtensionHost>>>,
     api_key_override: Option<&str>,
     session_manager: SessionManager,
 ) -> Result<AgentSession, String> {
     let cwd = env::current_dir().map_err(|err| err.to_string())?;
-    let agent_tools = build_agent_tools(&cwd, tool_names)?;
-    let tool_defs = build_tool_defs(tool_names)?;
+    let agent_tools = build_agent_tools(&cwd, tool_names, extension_tools, extension_host)?;
+    let tool_defs = build_tool_defs(tool_names, extension_tools)?;
 
     let stream_fn = match model.api.as_str() {
         "anthropic-messages" => {
@@ -3162,8 +3310,8 @@ fn create_cli_session(
             let tool_specs = tool_defs
                 .iter()
                 .map(|tool| AnthropicTool {
-                    name: tool.name.to_string(),
-                    description: tool.description.to_string(),
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
                     input_schema: tool.input_schema.clone(),
                 })
                 .collect::<Vec<_>>();
@@ -3175,8 +3323,8 @@ fn create_cli_session(
                 .iter()
                 .map(|tool| OpenAITool {
                     tool_type: "function".to_string(),
-                    name: tool.name.to_string(),
-                    description: tool.description.to_string(),
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
                     parameters: tool.input_schema.clone(),
                 })
                 .collect::<Vec<_>>();
@@ -3219,26 +3367,29 @@ fn create_cli_session(
     Ok(session)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_rpc_session(
     model: RegistryModel,
     registry: ModelRegistry,
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
     tool_names: Option<&[String]>,
+    extension_tools: &[ExtensionTool],
+    extension_host: Option<Rc<RefCell<ExtensionHost>>>,
     api_key_override: Option<&str>,
     session_manager: SessionManager,
 ) -> Result<AgentSession, String> {
     let cwd = env::current_dir().map_err(|err| err.to_string())?;
-    let agent_tools = build_agent_tools(&cwd, tool_names)?;
-    let tool_defs = build_tool_defs(tool_names)?;
+    let agent_tools = build_agent_tools(&cwd, tool_names, extension_tools, extension_host)?;
+    let tool_defs = build_tool_defs(tool_names, extension_tools)?;
     let stream_fn = match model.api.as_str() {
         "anthropic-messages" => {
             let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
             let tool_specs = tool_defs
                 .iter()
                 .map(|tool| AnthropicTool {
-                    name: tool.name.to_string(),
-                    description: tool.description.to_string(),
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
                     input_schema: tool.input_schema.clone(),
                 })
                 .collect::<Vec<_>>();
@@ -3250,8 +3401,8 @@ fn create_rpc_session(
                 .iter()
                 .map(|tool| OpenAITool {
                     tool_type: "function".to_string(),
-                    name: tool.name.to_string(),
-                    description: tool.description.to_string(),
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
                     parameters: tool.input_schema.clone(),
                 })
                 .collect::<Vec<_>>();
