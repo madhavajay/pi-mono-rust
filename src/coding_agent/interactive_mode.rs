@@ -1,6 +1,9 @@
 use crate::agent::AgentMessage;
 use crate::core::messages::{ContentBlock, UserContent};
-use crate::tui::{Container, Spacer, Text};
+use crate::tui::{
+    get_capabilities, get_image_dimensions, image_fallback, render_image, Container,
+    ImageRenderOptions, Spacer, Text,
+};
 use serde_json::Value;
 
 pub struct InteractiveMode {
@@ -122,9 +125,11 @@ pub fn format_content_blocks(
                 }
                 parts.push(entry);
             }
-            ContentBlock::Image { mime_type, .. } => {
+            ContentBlock::Image {
+                mime_type, data, ..
+            } => {
                 if show_images {
-                    parts.push(format!("Image attachment ({mime_type})"));
+                    parts.push(format_image_block(mime_type, data));
                 }
             }
         }
@@ -154,6 +159,57 @@ fn format_json(value: &Value) -> String {
         return String::new();
     }
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Format an image block for display in the interactive mode.
+/// When the terminal supports inline images (Kitty/iTerm2), renders the image inline.
+/// Otherwise, shows fallback text like "[Image: [image/png] 800x600]".
+fn format_image_block(mime_type: &str, data: &str) -> String {
+    let caps = get_capabilities();
+
+    if caps.images.is_none() {
+        // Terminal doesn't support inline images, show fallback
+        let dimensions = get_image_dimensions(data, mime_type);
+        return image_fallback(mime_type, dimensions, None);
+    }
+
+    // Try to render the image inline
+    let dimensions = match get_image_dimensions(data, mime_type) {
+        Some(dims) => dims,
+        None => {
+            // Can't parse dimensions, show fallback
+            return image_fallback(mime_type, None, None);
+        }
+    };
+
+    // Render with reasonable defaults for chat display
+    let options = ImageRenderOptions {
+        max_width_cells: Some(60),
+        max_height_cells: Some(30),
+        preserve_aspect_ratio: Some(true),
+    };
+
+    match render_image(data, dimensions, &options) {
+        Some(result) => {
+            // Build the output: empty lines for height, then cursor up + image sequence
+            let mut lines = Vec::new();
+            for _ in 0..(result.rows.saturating_sub(1)) {
+                lines.push(String::new());
+            }
+            // Move cursor up to first row, then output image
+            let move_up = if result.rows > 1 {
+                format!("\x1b[{}A", result.rows - 1)
+            } else {
+                String::new()
+            };
+            lines.push(format!("{}{}", move_up, result.sequence));
+            lines.join("\n")
+        }
+        None => {
+            // Rendering failed, show fallback
+            image_fallback(mime_type, Some(dimensions), None)
+        }
+    }
 }
 
 impl Default for InteractiveMode {
