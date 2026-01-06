@@ -6,6 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -655,6 +656,10 @@ impl SessionManager {
         SessionManager::new(cwd, session_dir, None, true)
     }
 
+    pub fn create_with_dir(cwd: PathBuf, session_dir: PathBuf) -> Self {
+        SessionManager::new(cwd, session_dir, None, true)
+    }
+
     pub fn open(path: PathBuf, session_dir: Option<PathBuf>) -> Self {
         let entries = load_entries_from_file(&path);
         let cwd = entries
@@ -1278,15 +1283,21 @@ fn get_default_session_dir(cwd: &Path) -> PathBuf {
             .trim_start_matches('/')
             .replace(['/', '\\', ':'], "-")
     );
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = home
-        .join(".pi")
-        .join("agent")
-        .join("sessions")
-        .join(safe_path);
+    let agent_dir = resolve_agent_dir();
+    let dir = agent_dir.join("sessions").join(safe_path);
     let _ = fs::create_dir_all(&dir);
     dir
+}
+
+fn resolve_agent_dir() -> PathBuf {
+    if let Ok(dir) = env::var("PI_CODING_AGENT_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".pi").join("agent")
 }

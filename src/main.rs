@@ -13,7 +13,7 @@ use pi::core::messages::{
     Usage, UserContent,
 };
 use pi::core::session_manager::SessionManager;
-use pi::tools::{default_tools, ToolContext, ToolDefinition};
+use pi::tools::{default_tools, ToolDefinition};
 use pi::{parse_args, Args, ListModels, Mode};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::rc::Rc;
 
@@ -53,7 +53,8 @@ Options:
   @file            Include file contents in prompt (text or images)
 
 Notes:
-  Interactive mode and other flags are not implemented yet."
+  Interactive mode is not implemented yet.
+  --resume, --hook, --tool, --export, --no-skills, --skills are not implemented yet."
     );
 }
 
@@ -63,20 +64,8 @@ fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
     if parsed.thinking.is_some() {
         unsupported.push("--thinking");
     }
-    if parsed.continue_session {
-        unsupported.push("--continue");
-    }
     if parsed.resume {
         unsupported.push("--resume");
-    }
-    if parsed.no_session {
-        unsupported.push("--no-session");
-    }
-    if parsed.session.is_some() {
-        unsupported.push("--session");
-    }
-    if parsed.session_dir.is_some() {
-        unsupported.push("--session-dir");
     }
     if parsed.hooks.is_some() {
         unsupported.push("--hook");
@@ -120,13 +109,6 @@ struct OpenAICallOptions<'a> {
 struct FileInputImage {
     mime_type: String,
     data: String,
-}
-
-struct PrintModeOptions<'a> {
-    tool_names: Option<&'a [String]>,
-    images: &'a [FileInputImage],
-    system_prompt: Option<String>,
-    append_system_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -889,7 +871,8 @@ fn openai_output_to_content_blocks(output: &[OpenAIOutputItem]) -> Vec<OpenAICon
     let mut blocks = Vec::new();
     for item in output {
         match item {
-            OpenAIOutputItem::Message { content, .. } => {
+            OpenAIOutputItem::Message { role, content } => {
+                let _ = role;
                 let mut text = String::new();
                 for part in content {
                     match part {
@@ -920,349 +903,276 @@ fn openai_output_to_content_blocks(output: &[OpenAIOutputItem]) -> Vec<OpenAICon
     blocks
 }
 
-fn openai_output_to_input_items(output: &[OpenAIOutputItem]) -> Vec<OpenAIInputItem> {
-    let mut items = Vec::new();
-    for item in output {
-        match item {
-            OpenAIOutputItem::Message { role, content } => {
-                let mut converted = Vec::new();
-                for part in content {
-                    match part {
-                        OpenAIOutputContent::OutputText { text } => {
-                            converted.push(OpenAIMessageContent::OutputText { text: text.clone() });
-                        }
-                        OpenAIOutputContent::Refusal { refusal } => {
-                            converted.push(OpenAIMessageContent::OutputText {
-                                text: refusal.clone(),
-                            });
-                        }
-                        OpenAIOutputContent::Other => {}
-                    }
-                }
-                if !converted.is_empty() {
-                    items.push(OpenAIInputItem::Message {
-                        role: role.clone(),
-                        content: converted,
-                    });
-                }
-            }
-            OpenAIOutputItem::FunctionCall {
-                id,
-                call_id,
-                name,
-                arguments,
-            } => {
-                items.push(OpenAIInputItem::FunctionCall {
-                    id: id.clone(),
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                });
-            }
-            OpenAIOutputItem::Other => {}
-        }
-    }
-    items
-}
-
-struct OpenAIToolCall {
-    call_id: String,
-    name: String,
-    arguments: Value,
-}
-
-fn extract_openai_tool_calls(output: &[OpenAIOutputItem]) -> Vec<OpenAIToolCall> {
-    let mut calls = Vec::new();
-    for item in output {
-        if let OpenAIOutputItem::FunctionCall {
-            call_id,
-            name,
-            arguments,
-            ..
-        } = item
-        {
-            calls.push(OpenAIToolCall {
-                call_id: call_id.clone(),
-                name: name.clone(),
-                arguments: parse_openai_tool_arguments(arguments),
-            });
-        }
-    }
-    calls
-}
-
-fn run_print_mode(
+fn run_print_mode_session(
     mode: Mode,
+    session: &mut AgentSession,
     messages: &[String],
-    model: &RegistryModel,
-    api_key_override: Option<&str>,
-    options: PrintModeOptions<'_>,
+    initial_message: Option<String>,
+    initial_images: &[FileInputImage],
 ) -> Result<(), String> {
-    match model.api.as_str() {
-        "anthropic-messages" => {
-            run_print_mode_anthropic(mode, messages, model, api_key_override, options)
-        }
-        "openai-responses" => {
-            run_print_mode_openai(mode, messages, model, api_key_override, options)
-        }
-        _ => Err(format!(
-            "Model API \"{}\" is not supported in print mode.",
-            model.api
-        )),
+    if matches!(mode, Mode::Json) {
+        let _ = session.subscribe(|event| {
+            if let Some(value) = serialize_agent_event(event) {
+                emit_json(&value);
+            }
+        });
     }
-}
 
-fn run_print_mode_anthropic(
-    mode: Mode,
-    messages: &[String],
-    model: &RegistryModel,
-    api_key_override: Option<&str>,
-    options: PrintModeOptions<'_>,
-) -> Result<(), String> {
-    let prompt = messages.join("\n");
-    if prompt.trim().is_empty() && options.images.is_empty() {
+    let mut sent_any = false;
+    if initial_message.is_some() || !initial_images.is_empty() {
+        let content = build_user_content_from_files(initial_message.as_deref(), initial_images)?;
+        session
+            .prompt_content(content)
+            .map_err(|err| err.to_string())?;
+        sent_any = true;
+    }
+
+    for message in messages {
+        if message.trim().is_empty() {
+            continue;
+        }
+        session.prompt(message).map_err(|err| err.to_string())?;
+        sent_any = true;
+    }
+
+    if !sent_any {
         return Err("No messages provided.".to_string());
     }
 
-    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
-
-    let tool_defs = build_tool_defs(options.tool_names)?;
-    let tool_specs = tool_defs
-        .iter()
-        .map(|tool| AnthropicTool {
-            name: tool.name.to_string(),
-            description: tool.description.to_string(),
-            input_schema: tool.input_schema.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let cwd = env::current_dir().map_err(|err| format!("Failed to read cwd: {err}"))?;
-    let tool_ctx = ToolContext { cwd };
-
-    let mut initial_content = Vec::new();
-    if !prompt.trim().is_empty() {
-        initial_content.push(AnthropicContentBlock::Text { text: prompt });
-    }
-    initial_content.extend(
-        options
-            .images
-            .iter()
-            .map(|image| AnthropicContentBlock::Image {
-                source: AnthropicImageSource {
-                    source_type: "base64".to_string(),
-                    media_type: image.mime_type.clone(),
-                    data: image.data.clone(),
-                },
-            }),
-    );
-
-    let mut system = options.system_prompt.or_else(|| {
-        if use_oauth {
-            Some(DEFAULT_OAUTH_SYSTEM_PROMPT.to_string())
-        } else {
-            None
-        }
-    });
-    if let Some(append) = options.append_system_prompt {
-        system = Some(match system {
-            Some(base) => format!("{base}\n\n{append}"),
-            None => append,
-        });
-    }
-
-    let mut conversation = vec![AnthropicMessage {
-        role: "user".to_string(),
-        content: initial_content,
-    }];
-
-    let mut last_response: Option<AnthropicResponse> = None;
-    for _ in 0..10 {
-        let response = call_anthropic(
-            conversation.clone(),
-            AnthropicCallOptions {
-                model: &model.id,
-                api_key: &api_key,
-                use_oauth,
-                tools: &tool_specs,
-                base_url: if model.base_url.is_empty() {
-                    "https://api.anthropic.com/v1"
-                } else {
-                    model.base_url.as_str()
-                },
-                extra_headers: model.headers.as_ref(),
-                system: system.as_deref(),
-            },
-        )?;
-        let tool_uses = extract_tool_uses(&response.content);
-
-        conversation.push(AnthropicMessage {
-            role: "assistant".to_string(),
-            content: response.content.clone(),
-        });
-
-        if tool_uses.is_empty() {
-            last_response = Some(response);
-            break;
-        }
-
-        let tool_results = tool_uses
-            .into_iter()
-            .map(|tool_use| execute_tool_use(&tool_use, &tool_defs, &tool_ctx))
-            .collect();
-
-        conversation.push(AnthropicMessage {
-            role: "user".to_string(),
-            content: tool_results,
-        });
-    }
-
-    let response = last_response.ok_or_else(|| "Tool loop exceeded limit".to_string())?;
-
-    match mode {
-        Mode::Text => {
-            for block in &response.content {
-                match block {
-                    AnthropicContentBlock::Text { text } => println!("{text}"),
-                    AnthropicContentBlock::Image { .. } => {}
-                    AnthropicContentBlock::ToolUse { .. } => {}
-                    AnthropicContentBlock::ToolResult { .. } => {}
-                }
+    if matches!(mode, Mode::Text) {
+        let messages = session.messages();
+        let assistant = messages.iter().rev().find_map(|message| {
+            if let AgentMessage::Assistant(assistant) = message {
+                Some(assistant)
+            } else {
+                None
             }
+        });
+
+        let assistant = assistant.ok_or_else(|| "No assistant response.".to_string())?;
+        if assistant.stop_reason == "error" || assistant.stop_reason == "aborted" {
+            return Err(assistant
+                .error_message
+                .clone()
+                .unwrap_or_else(|| format!("Request {}", assistant.stop_reason)));
         }
-        Mode::Json => {
-            let payload = json!({
-                "role": "assistant",
-                "content": response.content,
-                "stopReason": response.stop_reason,
-            });
-            println!("{payload}");
-        }
-        Mode::Rpc => {
-            return Err("RPC mode is not implemented yet.".to_string());
+        for block in &assistant.content {
+            if let ContentBlock::Text { text, .. } = block {
+                println!("{text}");
+            }
         }
     }
 
     Ok(())
 }
 
-fn run_print_mode_openai(
-    mode: Mode,
-    messages: &[String],
-    model: &RegistryModel,
-    api_key_override: Option<&str>,
-    options: PrintModeOptions<'_>,
-) -> Result<(), String> {
-    let prompt = messages.join("\n");
-    if prompt.trim().is_empty() && options.images.is_empty() {
-        return Err("No messages provided.".to_string());
+fn build_user_content_from_files(
+    message: Option<&str>,
+    images: &[FileInputImage],
+) -> Result<UserContent, String> {
+    let mut blocks = Vec::new();
+    if let Some(message) = message {
+        if !message.trim().is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: message.to_string(),
+                text_signature: None,
+            });
+        }
     }
-
-    let api_key = resolve_openai_credentials(api_key_override)?;
-    let tool_defs = build_tool_defs(options.tool_names)?;
-    let tool_specs = tool_defs
-        .iter()
-        .map(|tool| OpenAITool {
-            tool_type: "function".to_string(),
-            name: tool.name.to_string(),
-            description: tool.description.to_string(),
-            parameters: tool.input_schema.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let cwd = env::current_dir().map_err(|err| format!("Failed to read cwd: {err}"))?;
-    let tool_ctx = ToolContext { cwd };
-
-    let mut system = options.system_prompt;
-    if let Some(append) = options.append_system_prompt {
-        system = Some(match system {
-            Some(base) => format!("{base}\n\n{append}"),
-            None => append,
+    for image in images {
+        blocks.push(ContentBlock::Image {
+            data: image.data.clone(),
+            mime_type: image.mime_type.clone(),
         });
     }
+    if blocks.is_empty() {
+        return Err("No prompt content provided.".to_string());
+    }
+    Ok(UserContent::Blocks(blocks))
+}
 
-    let mut conversation = Vec::new();
-    if let Some(system_text) = system {
+fn openai_context_to_input_items(
+    model: &RegistryModel,
+    context: &LlmContext,
+) -> Vec<OpenAIInputItem> {
+    let mut items = Vec::new();
+    if !context.system_prompt.trim().is_empty() {
         let role = if model.reasoning {
             "developer"
         } else {
             "system"
         };
-        conversation.push(OpenAIInputItem::Message {
+        items.push(OpenAIInputItem::Message {
             role: role.to_string(),
-            content: vec![OpenAIMessageContent::InputText { text: system_text }],
+            content: vec![OpenAIMessageContent::InputText {
+                text: context.system_prompt.clone(),
+            }],
         });
     }
 
-    let mut user_content = Vec::new();
-    if !prompt.trim().is_empty() {
-        user_content.push(OpenAIMessageContent::InputText { text: prompt });
-    }
     let supports_images = model.input.iter().any(|entry| entry == "image");
-    if supports_images {
-        for image in options.images {
-            user_content.push(OpenAIMessageContent::InputImage {
-                image_url: format!("data:{};base64,{}", image.mime_type, image.data),
-                detail: Some("auto".to_string()),
-            });
-        }
-    }
-    if user_content.is_empty() {
-        return Err("No messages provided.".to_string());
-    }
-    conversation.push(OpenAIInputItem::Message {
-        role: "user".to_string(),
-        content: user_content,
-    });
-
-    let mut last_response: Option<OpenAIResponse> = None;
-    for _ in 0..10 {
-        let response = call_openai(
-            conversation.clone(),
-            OpenAICallOptions {
-                model: &model.id,
-                api_key: &api_key,
-                tools: &tool_specs,
-                base_url: if model.base_url.is_empty() {
-                    "https://api.openai.com/v1"
-                } else {
-                    model.base_url.as_str()
-                },
-                extra_headers: model.headers.as_ref(),
-            },
-        )?;
-
-        let tool_calls = extract_openai_tool_calls(&response.output);
-        conversation.extend(openai_output_to_input_items(&response.output));
-
-        if tool_calls.is_empty() {
-            last_response = Some(response);
-            break;
-        }
-
-        let tool_results = tool_calls.into_iter().map(|call| {
-            let tool_use = ToolUse {
-                id: call.call_id.clone(),
-                name: call.name,
-                input: call.arguments,
-            };
-            let output = match execute_tool(&tool_use, &tool_defs, &tool_ctx) {
-                Ok(output) => output,
-                Err(message) => format!("Error: {message}"),
-            };
-            OpenAIInputItem::FunctionCallOutput {
-                call_id: call.call_id,
-                output,
+    for message in &context.messages {
+        match message {
+            AgentMessage::User(user) => {
+                let parts = openai_user_content_parts(&user.content, supports_images);
+                if !parts.is_empty() {
+                    items.push(OpenAIInputItem::Message {
+                        role: "user".to_string(),
+                        content: parts,
+                    });
+                }
             }
-        });
-
-        conversation.extend(tool_results);
+            AgentMessage::Assistant(assistant) => {
+                items.extend(openai_assistant_items(assistant));
+            }
+            AgentMessage::ToolResult(result) => {
+                let (call_id, _) = split_openai_tool_call_id(&result.tool_call_id);
+                items.push(OpenAIInputItem::FunctionCallOutput {
+                    call_id,
+                    output: tool_result_text(&result.content),
+                });
+            }
+            AgentMessage::Custom(_) => {}
+        }
     }
 
-    let response = last_response.ok_or_else(|| "Tool loop exceeded limit".to_string())?;
+    items
+}
+
+fn openai_user_content_parts(
+    content: &UserContent,
+    supports_images: bool,
+) -> Vec<OpenAIMessageContent> {
+    match content {
+        UserContent::Text(text) => {
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![OpenAIMessageContent::InputText { text: text.clone() }]
+            }
+        }
+        UserContent::Blocks(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text, .. } => {
+                        if !text.trim().is_empty() {
+                            parts.push(OpenAIMessageContent::InputText { text: text.clone() });
+                        }
+                    }
+                    ContentBlock::Image { data, mime_type } => {
+                        if supports_images {
+                            parts.push(OpenAIMessageContent::InputImage {
+                                image_url: format!("data:{};base64,{}", mime_type, data),
+                                detail: Some("auto".to_string()),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            parts
+        }
+    }
+}
+
+fn openai_assistant_items(assistant: &AssistantMessage) -> Vec<OpenAIInputItem> {
+    let mut items = Vec::new();
+    let mut content = Vec::new();
+
+    for block in &assistant.content {
+        match block {
+            ContentBlock::Text { text, .. } => {
+                content.push(OpenAIMessageContent::OutputText { text: text.clone() });
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                content.push(OpenAIMessageContent::OutputText {
+                    text: thinking.clone(),
+                });
+            }
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => {
+                if !content.is_empty() {
+                    items.push(OpenAIInputItem::Message {
+                        role: "assistant".to_string(),
+                        content,
+                    });
+                    content = Vec::new();
+                }
+                let (call_id, tool_id) = split_openai_tool_call_id(id);
+                items.push(OpenAIInputItem::FunctionCall {
+                    id: tool_id,
+                    call_id,
+                    name: name.clone(),
+                    arguments: openai_arguments_string(arguments),
+                });
+            }
+            ContentBlock::Image { .. } => {}
+        }
+    }
+
+    if !content.is_empty() {
+        items.push(OpenAIInputItem::Message {
+            role: "assistant".to_string(),
+            content,
+        });
+    }
+
+    items
+}
+
+fn openai_arguments_string(arguments: &Value) -> String {
+    match arguments {
+        Value::String(value) => value.clone(),
+        _ => serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string()),
+    }
+}
+
+fn split_openai_tool_call_id(value: &str) -> (String, String) {
+    match value.split_once('|') {
+        Some((call_id, tool_id)) => (call_id.to_string(), tool_id.to_string()),
+        None => (value.to_string(), value.to_string()),
+    }
+}
+
+fn tool_result_text(content: &[ContentBlock]) -> String {
+    let mut text = String::new();
+    for block in content {
+        if let ContentBlock::Text { text: chunk, .. } = block {
+            text.push_str(chunk);
+        }
+    }
+    text
+}
+
+fn openai_assistant_message_from_response(
+    model: &RegistryModel,
+    response: OpenAIResponse,
+) -> Result<AssistantMessage, String> {
     let content_blocks = openai_output_to_content_blocks(&response.output);
-    let has_tool_calls = content_blocks
+    let content = content_blocks
+        .into_iter()
+        .map(|block| match block {
+            OpenAIContentBlock::Text { text } => ContentBlock::Text {
+                text,
+                text_signature: None,
+            },
+            OpenAIContentBlock::ToolUse { id, name, input } => ContentBlock::ToolCall {
+                id,
+                name,
+                arguments: input,
+                thought_signature: None,
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let has_tool_calls = content
         .iter()
-        .any(|block| matches!(block, OpenAIContentBlock::ToolUse { .. }));
+        .any(|block| matches!(block, ContentBlock::ToolCall { .. }));
     let stop_reason = match response.status.as_deref() {
         Some("completed") | None => "stop",
         Some("incomplete") => "length",
@@ -1278,80 +1188,38 @@ fn run_print_mode_openai(
         stop_reason
     };
 
-    match mode {
-        Mode::Text => {
-            for block in &content_blocks {
-                if let OpenAIContentBlock::Text { text } = block {
-                    println!("{text}");
-                }
-            }
-        }
-        Mode::Json => {
-            let payload = json!({
-                "role": "assistant",
-                "content": content_blocks,
-                "stopReason": stop_reason,
-            });
-            println!("{payload}");
-        }
-        Mode::Rpc => {
-            return Err("RPC mode is not implemented yet.".to_string());
-        }
-    }
-
-    Ok(())
+    Ok(AssistantMessage {
+        content,
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        usage: empty_usage(),
+        stop_reason: stop_reason.to_string(),
+        error_message: None,
+        timestamp: now_millis(),
+    })
 }
 
-#[derive(Debug, Clone)]
-struct ToolUse {
-    id: String,
-    name: String,
-    input: Value,
-}
-
-fn extract_tool_uses(blocks: &[AnthropicContentBlock]) -> Vec<ToolUse> {
-    let mut uses = Vec::new();
-    for block in blocks {
-        if let AnthropicContentBlock::ToolUse { id, name, input } = block {
-            uses.push(ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            });
-        }
+fn build_session_manager(parsed: &Args, cwd: &Path) -> SessionManager {
+    if parsed.no_session {
+        return SessionManager::in_memory();
     }
-    uses
-}
-
-fn execute_tool_use(
-    tool_use: &ToolUse,
-    tools: &[ToolDefinition],
-    ctx: &ToolContext,
-) -> AnthropicContentBlock {
-    match execute_tool(tool_use, tools, ctx) {
-        Ok(output) => AnthropicContentBlock::ToolResult {
-            tool_use_id: tool_use.id.clone(),
-            content: vec![AnthropicToolResultContent::Text { text: output }],
-            is_error: false,
-        },
-        Err(message) => AnthropicContentBlock::ToolResult {
-            tool_use_id: tool_use.id.clone(),
-            content: vec![AnthropicToolResultContent::Text { text: message }],
-            is_error: true,
-        },
+    if let Some(session) = &parsed.session {
+        return SessionManager::open(
+            PathBuf::from(session),
+            parsed.session_dir.as_ref().map(PathBuf::from),
+        );
     }
-}
-
-fn execute_tool(
-    tool_use: &ToolUse,
-    tools: &[ToolDefinition],
-    ctx: &ToolContext,
-) -> Result<String, String> {
-    let tool = tools.iter().find(|tool| tool.name == tool_use.name);
-    match tool {
-        Some(tool) => (tool.execute)(&tool_use.input, ctx),
-        None => Err(format!("Unknown tool: {}", tool_use.name)),
+    if parsed.continue_session {
+        return SessionManager::continue_recent(
+            cwd.to_path_buf(),
+            parsed.session_dir.as_ref().map(PathBuf::from),
+        );
     }
+    if let Some(session_dir) = &parsed.session_dir {
+        return SessionManager::create_with_dir(cwd.to_path_buf(), PathBuf::from(session_dir));
+    }
+    SessionManager::create(cwd.to_path_buf())
 }
 
 fn main() {
@@ -1444,6 +1312,15 @@ fn main() {
         "append system prompt",
     );
 
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            eprintln!("Error: Failed to read cwd: {err}");
+            process::exit(1);
+        }
+    };
+    let session_manager = build_session_manager(&parsed, &cwd);
+
     if matches!(mode, Mode::Rpc) {
         if !parsed.file_args.is_empty() {
             eprintln!("Error: @file arguments are not supported in RPC mode.");
@@ -1460,6 +1337,7 @@ fn main() {
             append_system_prompt,
             parsed.tools.as_deref(),
             parsed.api_key.as_deref(),
+            session_manager,
         ) {
             Ok(session) => session,
             Err(message) => {
@@ -1475,7 +1353,8 @@ fn main() {
     }
 
     let mut messages = parsed.messages.clone();
-    let mut images = Vec::new();
+    let mut initial_message = None;
+    let mut initial_images = Vec::new();
     if !parsed.file_args.is_empty() {
         let inputs = match build_file_inputs(&parsed.file_args) {
             Ok(inputs) => inputs,
@@ -1484,27 +1363,41 @@ fn main() {
                 process::exit(1);
             }
         };
-        if !inputs.text_prefix.is_empty() {
-            if messages.is_empty() {
-                messages.push(inputs.text_prefix);
+        if !inputs.text_prefix.is_empty() || !inputs.images.is_empty() {
+            initial_message = if messages.is_empty() {
+                Some(inputs.text_prefix)
             } else {
-                messages[0] = format!("{}{}", inputs.text_prefix, messages[0]);
+                let first = messages.remove(0);
+                Some(format!("{}{}", inputs.text_prefix, first))
+            };
+            if !inputs.images.is_empty() {
+                initial_images = inputs.images;
             }
         }
-        images = inputs.images;
     }
 
-    if let Err(message) = run_print_mode(
-        mode,
-        &messages,
-        &model,
+    let mut session = match create_cli_session(
+        model,
+        registry,
+        system_prompt,
+        append_system_prompt,
+        parsed.tools.as_deref(),
         parsed.api_key.as_deref(),
-        PrintModeOptions {
-            tool_names: parsed.tools.as_deref(),
-            images: &images,
-            system_prompt,
-            append_system_prompt,
-        },
+        session_manager,
+    ) {
+        Ok(session) => session,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            process::exit(1);
+        }
+    };
+
+    if let Err(message) = run_print_mode_session(
+        mode,
+        &mut session,
+        &messages,
+        initial_message,
+        &initial_images,
     ) {
         eprintln!("Error: {message}");
         process::exit(1);
@@ -2424,7 +2317,7 @@ fn build_agent_tools(
         Some(names) => {
             for name in names {
                 if !available.iter().any(|item| item == name) {
-                    return Err(format!("Tool \"{name}\" is not supported in RPC mode"));
+                    return Err(format!("Tool \"{name}\" is not supported"));
                 }
             }
             names.to_vec()
@@ -2702,35 +2595,100 @@ fn build_stream_fn(
     })
 }
 
-fn create_rpc_session(
+fn build_openai_stream_fn(
     model: RegistryModel,
-    registry: ModelRegistry,
+    api_key: String,
+    tool_specs: Vec<OpenAITool>,
+) -> AgentStreamFn {
+    Box::new(move |_agent_model, context| {
+        let input = openai_context_to_input_items(&model, context);
+        let response = call_openai(
+            input,
+            OpenAICallOptions {
+                model: &model.id,
+                api_key: &api_key,
+                tools: &tool_specs,
+                base_url: if model.base_url.is_empty() {
+                    "https://api.openai.com/v1"
+                } else {
+                    model.base_url.as_str()
+                },
+                extra_headers: model.headers.as_ref(),
+            },
+        );
+
+        match response {
+            Ok(response) => match openai_assistant_message_from_response(&model, response) {
+                Ok(message) => message,
+                Err(err) => assistant_error_message(&model, &err),
+            },
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
+fn merge_system_prompt(
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
-    tool_names: Option<&[String]>,
-    api_key_override: Option<&str>,
-) -> Result<AgentSession, String> {
-    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
-    let tool_specs = build_anthropic_tool_specs(tool_names)?;
-    let stream_fn = build_stream_fn(model.clone(), api_key, use_oauth, tool_specs);
-    let cwd = env::current_dir().map_err(|err| err.to_string())?;
-    let agent_tools = build_agent_tools(&cwd, tool_names)?;
-
-    let mut system = system_prompt.or_else(|| {
-        if use_oauth {
-            Some(DEFAULT_OAUTH_SYSTEM_PROMPT.to_string())
-        } else {
-            None
-        }
-    });
+) -> Option<String> {
+    let mut system = system_prompt;
     if let Some(append) = append_system_prompt {
         system = Some(match system {
             Some(base) => format!("{base}\n\n{append}"),
             None => append,
         });
     }
-    let system_value = system.unwrap_or_default();
+    system
+}
 
+fn create_cli_session(
+    model: RegistryModel,
+    registry: ModelRegistry,
+    system_prompt: Option<String>,
+    append_system_prompt: Option<String>,
+    tool_names: Option<&[String]>,
+    api_key_override: Option<&str>,
+    session_manager: SessionManager,
+) -> Result<AgentSession, String> {
+    let cwd = env::current_dir().map_err(|err| err.to_string())?;
+    let agent_tools = build_agent_tools(&cwd, tool_names)?;
+    let tool_defs = build_tool_defs(tool_names)?;
+
+    let stream_fn = match model.api.as_str() {
+        "anthropic-messages" => {
+            let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| AnthropicTool {
+                    name: tool.name.to_string(),
+                    description: tool.description.to_string(),
+                    input_schema: tool.input_schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            build_stream_fn(model.clone(), api_key, use_oauth, tool_specs)
+        }
+        "openai-responses" => {
+            let api_key = resolve_openai_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| OpenAITool {
+                    tool_type: "function".to_string(),
+                    name: tool.name.to_string(),
+                    description: tool.description.to_string(),
+                    parameters: tool.input_schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            build_openai_stream_fn(model.clone(), api_key, tool_specs)
+        }
+        _ => {
+            return Err(format!(
+                "Model API \"{}\" is not supported in print mode.",
+                model.api
+            ))
+        }
+    };
+
+    let system_value = merge_system_prompt(system_prompt, append_system_prompt).unwrap_or_default();
     let agent_model = to_agent_model(&model);
     let agent = Agent::new(AgentOptions {
         initial_state: Some(AgentStateOverride {
@@ -2743,7 +2701,44 @@ fn create_rpc_session(
         ..Default::default()
     });
 
-    let session_manager = SessionManager::in_memory();
+    let settings_manager = SettingsManager::create("", "");
+
+    Ok(AgentSession::new(AgentSessionConfig {
+        agent,
+        session_manager,
+        settings_manager,
+        model_registry: registry,
+    }))
+}
+
+fn create_rpc_session(
+    model: RegistryModel,
+    registry: ModelRegistry,
+    system_prompt: Option<String>,
+    append_system_prompt: Option<String>,
+    tool_names: Option<&[String]>,
+    api_key_override: Option<&str>,
+    session_manager: SessionManager,
+) -> Result<AgentSession, String> {
+    let (api_key, use_oauth) = resolve_anthropic_credentials(api_key_override)?;
+    let tool_specs = build_anthropic_tool_specs(tool_names)?;
+    let stream_fn = build_stream_fn(model.clone(), api_key, use_oauth, tool_specs);
+    let cwd = env::current_dir().map_err(|err| err.to_string())?;
+    let agent_tools = build_agent_tools(&cwd, tool_names)?;
+
+    let system_value = merge_system_prompt(system_prompt, append_system_prompt).unwrap_or_default();
+    let agent_model = to_agent_model(&model);
+    let agent = Agent::new(AgentOptions {
+        initial_state: Some(AgentStateOverride {
+            system_prompt: Some(system_value),
+            model: Some(agent_model),
+            tools: Some(agent_tools),
+            ..Default::default()
+        }),
+        stream_fn: Some(stream_fn),
+        ..Default::default()
+    });
+
     let settings_manager = SettingsManager::create("", "");
 
     Ok(AgentSession::new(AgentSessionConfig {

@@ -124,8 +124,10 @@ Planned modules (initial, not final):
 - CLI arg parsing parity tests.
 - Print mode wired to Anthropic Messages API and OpenAI Responses API (non-streaming).
 - Auth reuse via `~/.pi/agent/auth.json` or `PI_CODING_AGENT_DIR` fallback.
-- Minimal tool calling loop in print mode with built-in `read`, `write`, `edit`, `bash`.
+- Print mode uses AgentSession tool loop with built-in `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`.
 - Grep now supports directory search with regex/literal matching plus truncation notices for grep/find/ls output.
+- Print mode now uses `AgentSession` with session persistence (`--continue`, `--session`, `--session-dir`, `--no-session`).
+- Session default directory respects `PI_CODING_AGENT_DIR` for `sessions/`.
 
 ## Test Plan
 ### Baseline (TS)

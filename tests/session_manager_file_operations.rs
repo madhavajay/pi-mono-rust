@@ -1,4 +1,6 @@
-use pi::{find_most_recent_session, load_entries_from_file, FileEntry, SessionHeader};
+use pi::{
+    find_most_recent_session, load_entries_from_file, FileEntry, SessionHeader, SessionManager,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -157,4 +159,18 @@ fn find_most_recent_skips_invalid_files() {
     let result = find_most_recent_session(&dir).expect("expected session file");
     assert_eq!(result, valid);
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn create_with_dir_uses_custom_session_dir() {
+    let session_dir = temp_dir("custom-session-dir");
+    let cwd = temp_dir("cwd");
+    let session = SessionManager::create_with_dir(cwd.clone(), session_dir.clone());
+
+    assert_eq!(session.get_session_dir(), session_dir);
+    let session_file = session.get_session_file().expect("expected session file");
+    assert!(session_file.starts_with(&session_dir));
+
+    let _ = fs::remove_dir_all(session_dir);
+    let _ = fs::remove_dir_all(cwd);
 }

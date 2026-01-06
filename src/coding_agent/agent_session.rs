@@ -54,6 +54,29 @@ impl AgentSession {
         let settings_manager = config.settings_manager;
         let model_registry = config.model_registry;
 
+        let context = session_manager.build_session_context();
+        let messages: Vec<AgentMessage> = context
+            .messages
+            .iter()
+            .filter_map(convert_core_message)
+            .collect();
+        if !messages.is_empty() {
+            agent.replace_messages(messages);
+        }
+        if let Some(model) = context.model.clone() {
+            if let Some(match_model) = model_registry.find(&model.provider, &model.model_id) {
+                agent.set_model(crate::agent::Model {
+                    id: match_model.id,
+                    name: match_model.name,
+                    api: match_model.api,
+                    provider: match_model.provider,
+                });
+            }
+        }
+        if let Some(level) = thinking_level_from_str(&context.thinking_level) {
+            agent.set_thinking_level(level);
+        }
+
         let listeners_ref = listeners.clone();
         let unsubscribe = agent.subscribe(move |event| {
             let session_event = AgentSessionEvent::Agent(Box::new(event.clone()));
