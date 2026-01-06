@@ -2,6 +2,7 @@ use pi::agent::{
     Agent, AgentMessage, AgentOptions, AgentStateOverride, AgentTool, AgentToolResult, LlmContext,
     Model as AgentModel, QueueMode, ThinkingLevel,
 };
+use pi::cli::args::ThinkingLevel as CliThinkingLevel;
 use pi::cli::list_models::list_models;
 use pi::coding_agent::tools as agent_tools;
 use pi::coding_agent::{
@@ -47,6 +48,7 @@ Options:
   --system-prompt  Custom system prompt (literal or file path)
   --append-system-prompt  Append text to system prompt (literal or file path)
   --tools          Comma-separated tool allowlist
+  --thinking       Set thinking level: off, minimal, low, medium, high, xhigh
   --print, -p      Print mode (single-shot)
   --list-models    List available models
   --export <file>  Export session file to HTML and exit
@@ -64,9 +66,6 @@ Notes:
 fn collect_unsupported_flags(parsed: &Args) -> Vec<&'static str> {
     let mut unsupported = Vec::new();
 
-    if parsed.thinking.is_some() {
-        unsupported.push("--thinking");
-    }
     if parsed.resume {
         unsupported.push("--resume");
     }
@@ -1194,6 +1193,23 @@ fn build_session_manager(parsed: &Args, cwd: &Path) -> SessionManager {
     SessionManager::create(cwd.to_path_buf())
 }
 
+fn cli_thinking_level(level: &CliThinkingLevel) -> ThinkingLevel {
+    match level {
+        CliThinkingLevel::Off => ThinkingLevel::Off,
+        CliThinkingLevel::Minimal => ThinkingLevel::Minimal,
+        CliThinkingLevel::Low => ThinkingLevel::Low,
+        CliThinkingLevel::Medium => ThinkingLevel::Medium,
+        CliThinkingLevel::High => ThinkingLevel::High,
+        CliThinkingLevel::XHigh => ThinkingLevel::XHigh,
+    }
+}
+
+fn apply_cli_thinking_level(parsed: &Args, session: &mut AgentSession) {
+    if let Some(level) = parsed.thinking.as_ref() {
+        session.set_thinking_level(cli_thinking_level(level));
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let parsed = parse_args(&args);
@@ -1327,7 +1343,7 @@ fn main() {
             eprintln!("Error: RPC mode currently supports only \"anthropic-messages\" models.");
             process::exit(1);
         }
-        let session = match create_rpc_session(
+        let mut session = match create_rpc_session(
             model,
             registry,
             Some(system_prompt),
@@ -1342,6 +1358,7 @@ fn main() {
                 process::exit(1);
             }
         };
+        apply_cli_thinking_level(&parsed, &mut session);
         if let Err(message) = run_rpc_mode(session) {
             eprintln!("Error: {message}");
             process::exit(1);
@@ -1388,6 +1405,7 @@ fn main() {
             process::exit(1);
         }
     };
+    apply_cli_thinking_level(&parsed, &mut session);
 
     if let Err(message) = run_print_mode_session(
         mode,
