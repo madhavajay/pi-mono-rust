@@ -91,9 +91,17 @@ fn main() {
     let mode = parsed.mode.clone().unwrap_or(Mode::Text);
 
     let provider = parsed.provider.as_deref().unwrap_or("anthropic");
-    if provider != "anthropic" && provider != "openai" && provider != "openai-codex" {
+    let supported_providers = [
+        "anthropic",
+        "openai",
+        "openai-codex",
+        "google-gemini-cli",
+        "google-antigravity",
+    ];
+    if !supported_providers.contains(&provider) {
         eprintln!(
-            "Error: unsupported provider \"{provider}\". Only \"anthropic\", \"openai\", and \"openai-codex\" are supported."
+            "Error: unsupported provider \"{provider}\". Supported providers: {}",
+            supported_providers.join(", ")
         );
         process::exit(1);
     }
@@ -114,13 +122,17 @@ fn main() {
         }
     };
 
-    if model.api != "anthropic-messages"
-        && model.api != "openai-responses"
-        && model.api != "openai-codex-responses"
-    {
+    let supported_apis = [
+        "anthropic-messages",
+        "openai-responses",
+        "openai-codex-responses",
+        "google-gemini-cli",
+    ];
+    if !supported_apis.contains(&model.api.as_str()) {
         eprintln!(
-            "Error: unsupported model API \"{}\". Only \"anthropic-messages\", \"openai-responses\", and \"openai-codex-responses\" are supported.",
-            model.api
+            "Error: unsupported model API \"{}\". Supported APIs: {}",
+            model.api,
+            supported_apis.join(", ")
         );
         process::exit(1);
     }
