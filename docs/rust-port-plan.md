@@ -293,6 +293,19 @@ Planned modules (initial, not final):
   - Windows: Uses PowerShell to read clipboard image.
   - Image written to temp file with UUID-based name (pi-clipboard-{UUID}.png).
   - File path inserted at cursor position for inclusion in message.
+- **Google Gemini CLI (Cloud Code Assist) provider** - Full streaming support:
+  - `api/google_gemini_cli.rs`: Complete provider implementation with SSE streaming.
+  - Request/response types for Cloud Code Assist API (`v1internal:streamGenerateContent`).
+  - Message converter: Converts internal messages to Gemini Content format with user/model roles.
+  - Thinking support: Gemini 2.5+ models emit thinking blocks with `thought: true` parts.
+  - Tool calling: Function call handling with auto-generated IDs, function response formatting.
+  - System instructions via separate `systemInstruction` field.
+  - Project discovery: `discover_gemini_project()` calls `loadCodeAssist`/`onboardUser` APIs.
+  - OAuth token refresh: `refresh_google_cloud_token()` with Google OAuth2 endpoints.
+  - Auth resolution: Checks auth.json first, then `~/.gemini/oauth_creds.json` (official gemini CLI).
+  - Automatic token refresh when expired, project ID discovery from Cloud Code Assist API.
+  - CLI integration: `--provider google-gemini-cli --model gemini-2.5-flash` (or gemini-2.5-pro, etc.).
+  - **Live tests**: `tests/subscription_live_test.rs` with `gemini_cli_live_streaming_text` and `gemini_cli_live_tool_call`.
 - **PyO3 Python bindings** (feature-gated under `python` feature):
   - `src/python/mod.rs`: Python bindings for embedding pi-mono-rust in Python applications.
   - `PyAuthStorage`: Wrapper for credential storage (get/set/remove/list/reload).
@@ -301,6 +314,7 @@ Planned modules (initial, not final):
     - Anthropic Messages API (via `build_anthropic_stream_fn`)
     - OpenAI Responses API (via `build_openai_stream_fn`)
     - OpenAI Codex Responses API (via `build_codex_stream_fn`)
+    - Google Gemini CLI API (via `build_gemini_stream_fn`)
   - OAuth helper functions: `anthropic_get_auth_url`, `anthropic_exchange_code`, `anthropic_refresh_token`.
   - OAuth helper functions: `openai_codex_get_auth_url`, `openai_codex_exchange_code`, `openai_codex_refresh_token`.
   - Event streaming: Python callbacks receive session events as dicts (agent events, compaction events).

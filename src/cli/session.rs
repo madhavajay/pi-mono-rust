@@ -2,6 +2,9 @@ use crate::agent::{
     Agent, AgentOptions, AgentStateOverride, AgentTool, AgentToolResult, LlmContext,
     Model as AgentModel, ThinkingLevel,
 };
+use crate::api::google_gemini_cli::{
+    stream_google_gemini_cli, GeminiCliCallOptions, GeminiCliTool,
+};
 use crate::api::openai_codex::{stream_openai_codex_responses, CodexStreamOptions, CodexTool};
 use crate::api::{
     assistant_error_message, build_anthropic_messages, openai_context_to_input_items,
@@ -509,6 +512,35 @@ fn build_codex_stream_fn(
     })
 }
 
+fn build_gemini_cli_stream_fn(
+    model: RegistryModel,
+    access_token: String,
+    project_id: String,
+    tool_specs: Vec<GeminiCliTool>,
+) -> AgentStreamFn {
+    Box::new(move |_agent_model, context, events| {
+        let response = stream_google_gemini_cli(
+            &model,
+            context,
+            GeminiCliCallOptions {
+                model: &model.id,
+                access_token: &access_token,
+                project_id: &project_id,
+                tools: &tool_specs,
+                base_url: &model.base_url,
+                system: None, // Will be set from context
+                thinking_enabled: model.reasoning,
+            },
+            events,
+        );
+
+        match response {
+            Ok(response) => response,
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
 fn merge_system_prompt(
     system_prompt: Option<String>,
     append_system_prompt: Option<String>,
@@ -579,6 +611,19 @@ pub fn create_cli_session(
                 })
                 .collect::<Vec<_>>();
             build_codex_stream_fn(model.clone(), api_key, tool_specs)
+        }
+        "google-gemini-cli" => {
+            let (access_token, project_id) =
+                crate::cli::auth::resolve_google_gemini_cli_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| GeminiCliTool {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            build_gemini_cli_stream_fn(model.clone(), access_token, project_id, tool_specs)
         }
         _ => {
             return Err(format!(
@@ -672,6 +717,19 @@ pub fn create_rpc_session(
                 })
                 .collect::<Vec<_>>();
             build_codex_stream_fn(model.clone(), api_key, tool_specs)
+        }
+        "google-gemini-cli" => {
+            let (access_token, project_id) =
+                crate::cli::auth::resolve_google_gemini_cli_credentials(api_key_override)?;
+            let tool_specs = tool_defs
+                .iter()
+                .map(|tool| GeminiCliTool {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
+                })
+                .collect::<Vec<_>>();
+            build_gemini_cli_stream_fn(model.clone(), access_token, project_id, tool_specs)
         }
         _ => {
             return Err(format!(

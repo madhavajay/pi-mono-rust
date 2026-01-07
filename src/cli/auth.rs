@@ -137,3 +137,132 @@ pub fn resolve_openai_codex_credentials(api_key_override: Option<&str>) -> Resul
 
     Err("Missing OpenAI Codex credentials. Set OPENAI_CODEX_API_KEY or add openai-codex to auth.json.".to_string())
 }
+
+/// Gemini CLI credentials structure from ~/.gemini/oauth_creds.json
+#[derive(serde::Deserialize)]
+struct GeminiCliOAuthCreds {
+    access_token: String,
+    refresh_token: Option<String>,
+    expiry_date: Option<i64>,
+}
+
+/// Resolve Google Gemini CLI credentials.
+/// First checks auth.json, then ~/.gemini/oauth_creds.json (used by the official gemini CLI).
+/// Returns (access_token, project_id) as a JSON string that the provider expects.
+pub fn resolve_google_gemini_cli_credentials(
+    api_key_override: Option<&str>,
+) -> Result<(String, String), String> {
+    if let Some(key) = api_key_override {
+        // Assume it's a JSON with token and projectId
+        if let Ok(parsed) = serde_json::from_str::<Value>(key) {
+            if let (Some(token), Some(project)) = (
+                parsed.get("token").and_then(Value::as_str),
+                parsed.get("projectId").and_then(Value::as_str),
+            ) {
+                return Ok((token.to_string(), project.to_string()));
+            }
+        }
+        return Err("Invalid google-gemini-cli credentials format. Expected JSON with 'token' and 'projectId'.".to_string());
+    }
+
+    // Check auth.json first (has project ID)
+    if let Some(credential) = read_auth_credential("google-gemini-cli") {
+        match credential {
+            AuthCredential::OAuth {
+                access, project_id, ..
+            } => {
+                if let Some(project) = project_id {
+                    return Ok((access, project));
+                }
+            }
+            AuthCredential::ApiKey { key: _ } => {
+                // API key alone - need to discover project
+                // For now, return error asking user to use /login
+                return Err("google-gemini-cli requires OAuth with a project ID. \
+                     Use /login to authenticate."
+                    .to_string());
+            }
+        }
+    }
+
+    // Check google-antigravity too (same API, different endpoint)
+    if let Some(AuthCredential::OAuth {
+        access,
+        project_id: Some(project),
+        ..
+    }) = read_auth_credential("google-antigravity")
+    {
+        return Ok((access, project));
+    }
+
+    // Try to load from ~/.gemini/oauth_creds.json (official gemini CLI)
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let gemini_creds_path = home.join(".gemini").join("oauth_creds.json");
+
+    if gemini_creds_path.exists() {
+        let content = std::fs::read_to_string(&gemini_creds_path)
+            .map_err(|e| format!("Failed to read gemini CLI credentials: {e}"))?;
+
+        let creds: GeminiCliOAuthCreds = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse gemini CLI credentials: {e}"))?;
+
+        // Check if token is expired
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        if let Some(expiry) = creds.expiry_date {
+            if expiry <= now_ms {
+                // Token expired, try to refresh
+                if let Some(refresh) = &creds.refresh_token {
+                    // We need to discover project first, then refresh
+                    // For simplicity, try to discover project with current token anyway
+                    // (might work for slightly expired tokens)
+                    match crate::api::google_gemini_cli::discover_gemini_project(
+                        &creds.access_token,
+                    ) {
+                        Ok(project_id) => {
+                            // Try refresh
+                            match crate::api::google_gemini_cli::refresh_google_cloud_token(
+                                refresh,
+                                &project_id,
+                            ) {
+                                Ok(new_creds) => {
+                                    // Update the gemini CLI creds file (optional, for next use)
+                                    // For now just return the new credentials
+                                    return Ok((new_creds.access, project_id));
+                                }
+                                Err(_) => {
+                                    // Refresh failed, try with existing token anyway
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Can't discover project with expired token
+                            return Err(
+                                "google-gemini-cli token expired. Please run 'gemini' CLI to refresh, or use /login."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Discover project ID using the access token
+        let project_id =
+            crate::api::google_gemini_cli::discover_gemini_project(&creds.access_token)
+                .map_err(|e| format!("Failed to discover Gemini project: {e}"))?;
+
+        return Ok((creds.access_token, project_id));
+    }
+
+    Err("Missing google-gemini-cli credentials. \
+         Either run 'gemini' CLI to authenticate, or use /login in pi."
+        .to_string())
+}
