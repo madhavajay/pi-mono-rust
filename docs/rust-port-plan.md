@@ -230,9 +230,40 @@ Planned modules (initial, not final):
   - Test verifies TypeScript extensions can be loaded via jiti when available.
   - Falls back gracefully with proper error message when jiti is not installed.
   - Uses ESM `export default` syntax matching TS test conventions.
+- **Interactive TUI slash command autocomplete**:
+  - `tui/autocomplete.rs`: Extended to support slash command completion.
+  - `SlashCommand` struct with name and description for autocomplete display.
+  - `get_suggestions()` method triggers command autocomplete when typing `/` at line start.
+  - `apply_completion()` handles slash command completion with trailing space.
+  - `tui/components/select_list.rs`: New dropdown component for autocomplete display.
+  - Arrow key navigation, scroll indicators, and selection highlighting.
+  - Unit tests for command filtering, case-insensitive matching, and completion application.
+- **New slash commands in interactive mode**:
+  - `/clear` - Clears the screen/chat history.
+  - `/copy` - Copies last assistant message to clipboard (platform-aware: pbcopy/xclip/wl-copy/clip.exe).
+  - `/help` - Shows all available commands with descriptions.
+  - `/new` - Starts a new session with fresh ID.
+  - `/reset` - Resets the current session (clears messages).
+  - `/session` - Shows session info (ID, message count, model).
+  - `/theme [name]` - Lists or changes the current theme.
+  - Editor autocomplete integration: Triggers on `/`, Tab for files, Up/Down/Tab/Enter for selection.
+- **Bash command execution (`!` prefix)**:
+  - Single `!` runs command and displays output in chat.
+  - Double `!!` runs command without adding to context.
+  - Displays command, stdout, exit code (if non-zero), and cancelled status.
+  - Added to editor history for command recall.
 
-## Remaining Gaps (Next)
-- Interactive TUI parity: Additional input component improvements if needed.
+## Remaining Gaps (Accurate as of 2026-01-07)
+
+### Interactive TUI - Missing Features:
+1. **Missing slash commands**: `/branch`, `/tree`, `/login`, `/logout`, `/resume` (need UI selectors)
+2. **Interactive UI selectors** - `/model` and `/settings` are text-only, no picker UI (TreeSelector/SessionSelector exist but not wired)
+3. **Prompt template suggestions** - Not wired to autocomplete
+4. **Extension command suggestions** - Not wired to autocomplete
+5. **Clipboard image paste** - Ctrl+V not supported
+
+### TS Extensions:
+- JS extensions work, TS extensions need jiti loader
 
 ## Test Plan
 ### Baseline (TS)

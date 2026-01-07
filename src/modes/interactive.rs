@@ -7,7 +7,9 @@ use crate::coding_agent::{
     parse_model_pattern, set_active_theme, AgentSession,
 };
 use crate::core::messages::UserContent;
-use crate::tui::{truncate_to_width, wrap_text_with_ansi, Editor};
+use crate::tui::{
+    truncate_to_width, wrap_text_with_ansi, CombinedAutocompleteProvider, Editor, SlashCommand,
+};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
@@ -422,6 +424,51 @@ fn create_share_links(session: &AgentSession) -> Result<(String, String), String
 }
 
 fn handle_key_event(key: KeyEvent, editor: &mut Editor) -> EditorAction {
+    // Handle autocomplete mode first
+    if editor.is_autocompleting() {
+        match key.code {
+            KeyCode::Esc => {
+                editor.cancel_autocomplete();
+                return EditorAction::Continue;
+            }
+            KeyCode::Up => {
+                editor.autocomplete_up();
+                return EditorAction::Continue;
+            }
+            KeyCode::Down => {
+                editor.autocomplete_down();
+                return EditorAction::Continue;
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                editor.apply_autocomplete();
+                // If it's a Tab, continue editing
+                // If it's Enter and the text starts with a command, let it submit
+                if key.code == KeyCode::Enter
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+                {
+                    return EditorAction::Submit;
+                }
+                return EditorAction::Continue;
+            }
+            KeyCode::Backspace => {
+                editor.handle_input("\x7f");
+                editor.try_trigger_autocomplete();
+                return EditorAction::Continue;
+            }
+            KeyCode::Char(ch) => {
+                editor.handle_input(&ch.to_string());
+                editor.try_trigger_autocomplete();
+                return EditorAction::Continue;
+            }
+            _ => {
+                // Cancel autocomplete on any other key
+                editor.cancel_autocomplete();
+            }
+        }
+    }
+
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             return EditorAction::Exit;
@@ -464,7 +511,10 @@ fn handle_key_event(key: KeyEvent, editor: &mut Editor) -> EditorAction {
             }
         }
         KeyCode::Tab => {
-            editor.handle_input("\t");
+            // Try to trigger file autocomplete on Tab
+            if !editor.try_force_file_autocomplete() {
+                // If no autocomplete, insert literal tab or do nothing
+            }
         }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             editor.handle_input("\x01");
@@ -477,10 +527,35 @@ fn handle_key_event(key: KeyEvent, editor: &mut Editor) -> EditorAction {
                 return EditorAction::Continue;
             }
             editor.handle_input(&ch.to_string());
+            // Auto-trigger autocomplete for / at line start
+            if ch == '/' {
+                editor.try_trigger_autocomplete();
+            }
         }
         _ => {}
     }
     EditorAction::Continue
+}
+
+fn get_slash_commands() -> Vec<SlashCommand> {
+    vec![
+        SlashCommand::new("changelog", Some("Show version changelog".to_string())),
+        SlashCommand::new("clear", Some("Clear the screen".to_string())),
+        SlashCommand::new("compact", Some("Compact the session".to_string())),
+        SlashCommand::new("copy", Some("Copy last message to clipboard".to_string())),
+        SlashCommand::new("exit", Some("Exit the session".to_string())),
+        SlashCommand::new("export", Some("Export session as HTML".to_string())),
+        SlashCommand::new("help", Some("Show available commands".to_string())),
+        SlashCommand::new("hotkeys", Some("Show keyboard shortcuts".to_string())),
+        SlashCommand::new("model", Some("Select AI model".to_string())),
+        SlashCommand::new("new", Some("Start new session".to_string())),
+        SlashCommand::new("quit", Some("Exit the session".to_string())),
+        SlashCommand::new("reset", Some("Reset session".to_string())),
+        SlashCommand::new("session", Some("Show session info".to_string())),
+        SlashCommand::new("settings", Some("Configure settings".to_string())),
+        SlashCommand::new("share", Some("Share session as GitHub Gist".to_string())),
+        SlashCommand::new("theme", Some("Change theme".to_string())),
+    ]
 }
 
 pub fn run_interactive_mode_session(
@@ -493,6 +568,11 @@ pub fn run_interactive_mode_session(
     let theme = load_theme_or_default(session.settings_manager.get_theme().as_deref());
     set_active_theme(theme.clone());
     let mut editor = Editor::new(theme.editor_theme());
+
+    // Set up autocomplete with slash commands
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let autocomplete_provider = CombinedAutocompleteProvider::new(get_slash_commands(), cwd);
+    editor.set_autocomplete_provider(autocomplete_provider);
 
     let mut stdout = io::stdout();
     let _guard = TerminalGuard::enter(&mut stdout)?;
@@ -531,6 +611,54 @@ pub fn run_interactive_mode_session(
                     if trimmed.is_empty() {
                         render_interactive_ui(&entries, &mut editor, &mut stdout)?;
                         continue;
+                    }
+                    // Handle bash command (! for normal, !! for excluded from context)
+                    if let Some(rest) = trimmed.strip_prefix('!') {
+                        let is_excluded = rest.starts_with('!');
+                        let command = if is_excluded {
+                            rest[1..].trim()
+                        } else {
+                            rest.trim()
+                        };
+                        if !command.is_empty() {
+                            editor.add_to_history(&prompt);
+                            match session.execute_bash(command) {
+                                Ok(result) => {
+                                    // Format output like a shell
+                                    let mut display = format!("$ {command}\n");
+                                    if !result.output.is_empty() {
+                                        display.push_str(&result.output);
+                                        if !result.output.ends_with('\n') {
+                                            display.push('\n');
+                                        }
+                                    }
+                                    if let Some(code) = result.exit_code {
+                                        if code != 0 {
+                                            display.push_str(&format!("[exit code: {code}]\n"));
+                                        }
+                                    }
+                                    if result.cancelled {
+                                        display.push_str("[cancelled]\n");
+                                    }
+                                    if is_excluded {
+                                        // For !!, just show output without adding to context
+                                        append_status_entry(&mut entries, display.trim_end());
+                                    } else {
+                                        // For !, show output and potentially add to context
+                                        // (though execute_bash doesn't add to session context)
+                                        append_status_entry(&mut entries, display.trim_end());
+                                    }
+                                }
+                                Err(err) => {
+                                    append_status_entry(
+                                        &mut entries,
+                                        &format!("Bash error: {err}"),
+                                    );
+                                }
+                            }
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
                     }
                     if trimmed.starts_with("/export") {
                         let rest = trimmed.trim_start_matches("/export").trim();
@@ -815,6 +943,131 @@ pub fn run_interactive_mode_session(
                     if matches!(trimmed, "/exit" | "/quit") {
                         break;
                     }
+                    if trimmed == "/clear" {
+                        entries.clear();
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
+                    if trimmed == "/help" {
+                        let help_text = [
+                            "Available commands:",
+                            "  /clear        - Clear the screen",
+                            "  /compact      - Compact the session",
+                            "  /copy         - Copy last assistant message to clipboard",
+                            "  /export       - Export session as HTML",
+                            "  /help         - Show this help",
+                            "  /hotkeys      - Show keyboard shortcuts",
+                            "  /model        - Select AI model",
+                            "  /reset        - Reset/clear the session",
+                            "  /session      - Show session information",
+                            "  /settings     - Configure settings",
+                            "  /share        - Share session as GitHub Gist",
+                            "  /theme <name> - Change theme",
+                            "  /changelog    - Show version changelog",
+                            "  /exit, /quit  - Exit the session",
+                            "",
+                            "Type / to see autocomplete suggestions.",
+                        ]
+                        .join("\n");
+                        append_status_entry(&mut entries, &help_text);
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
+                    if trimmed.starts_with("/theme") {
+                        let rest = trimmed.trim_start_matches("/theme").trim();
+                        let themes = available_themes();
+                        if rest.is_empty() {
+                            let current_theme = session
+                                .settings_manager
+                                .get_theme()
+                                .unwrap_or_else(|| "dark".to_string());
+                            let theme_list = themes
+                                .iter()
+                                .map(|t| {
+                                    if t == &current_theme {
+                                        format!("  * {t} (current)")
+                                    } else {
+                                        format!("    {t}")
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            append_status_entry(
+                                &mut entries,
+                                &format!("Available themes:\n{theme_list}\n\nUsage: /theme <name>"),
+                            );
+                        } else if themes.iter().any(|t| t == rest) {
+                            session.settings_manager.set_theme(rest);
+                            let theme = load_theme_or_default(Some(rest));
+                            set_active_theme(theme.clone());
+                            editor.set_theme(theme.editor_theme());
+                            append_status_entry(&mut entries, &format!("Theme changed to: {rest}"));
+                        } else {
+                            append_status_entry(
+                                &mut entries,
+                                &format!(
+                                    "Unknown theme: {rest}. Run /theme to see available themes."
+                                ),
+                            );
+                        }
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
+                    if trimmed == "/reset" {
+                        session.new_session();
+                        entries.clear();
+                        append_status_entry(&mut entries, "Session reset.");
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
+                    if trimmed == "/session" {
+                        let session_id = session.session_id();
+                        let message_count = session.messages().len();
+                        let model = &session.agent.state().model;
+                        let info = format!(
+                            "Session Info:\n  ID: {session_id}\n  Messages: {message_count}\n  Model: {}/{}",
+                            model.provider, model.id
+                        );
+                        append_status_entry(&mut entries, &info);
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
+                    if trimmed == "/copy" {
+                        // Get the last assistant message text
+                        if let Some(text) = session.get_last_assistant_text() {
+                            if text.is_empty() {
+                                append_status_entry(
+                                    &mut entries,
+                                    "No text content in last assistant message.",
+                                );
+                            } else {
+                                match copy_to_clipboard(&text) {
+                                    Ok(()) => {
+                                        append_status_entry(&mut entries, "Copied to clipboard.")
+                                    }
+                                    Err(err) => append_status_entry(
+                                        &mut entries,
+                                        &format!("Failed to copy: {err}"),
+                                    ),
+                                }
+                            }
+                        } else {
+                            append_status_entry(&mut entries, "No assistant messages to copy.");
+                        }
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
+                    if trimmed == "/new" {
+                        // Create a new session by resetting and generating a new ID
+                        session.new_session();
+                        entries.clear();
+                        append_status_entry(
+                            &mut entries,
+                            &format!("New session started: {}", session.session_id()),
+                        );
+                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                        continue;
+                    }
                     editor.add_to_history(&prompt);
                     prompt_and_append_text(
                         session,
@@ -844,4 +1097,52 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Try various clipboard commands based on what's available
+    // On Linux: xclip, xsel, or wl-copy (Wayland)
+    // On macOS: pbcopy
+    // On Windows: clip.exe
+
+    #[cfg(target_os = "macos")]
+    let clipboard_commands = [("pbcopy", &[] as &[&str])];
+
+    #[cfg(target_os = "windows")]
+    let clipboard_commands = [("clip.exe", &[] as &[&str])];
+
+    #[cfg(target_os = "linux")]
+    let clipboard_commands = [
+        ("wl-copy", &[] as &[&str]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let clipboard_commands: [(&str, &[&str]); 0] = [];
+
+    for (cmd, args) in clipboard_commands {
+        if let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(ref mut stdin) = child.stdin {
+                if stdin.write_all(text.as_bytes()).is_ok() {
+                    if let Ok(status) = child.wait() {
+                        if status.success() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err("No clipboard command available. Install xclip, xsel, or wl-copy.".to_string())
 }

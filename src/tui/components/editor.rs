@@ -1,10 +1,22 @@
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::tui::autocomplete::CombinedAutocompleteProvider;
+use crate::tui::components::select_list::{SelectList, SelectListTheme};
 use crate::tui::utils::{is_punctuation_char, is_whitespace_char, visible_width};
 
 #[derive(Clone, Copy)]
 pub struct EditorTheme {
     pub border_color: fn(&str) -> String,
+    pub select_list: SelectListTheme,
+}
+
+impl Default for EditorTheme {
+    fn default() -> Self {
+        Self {
+            border_color: |s| s.to_string(),
+            select_list: SelectListTheme::default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -35,6 +47,11 @@ pub struct Editor {
     // Bracketed paste mode buffering
     paste_buffer: String,
     is_in_paste: bool,
+    // Autocomplete support
+    autocomplete_provider: Option<CombinedAutocompleteProvider>,
+    autocomplete_list: Option<SelectList>,
+    autocomplete_prefix: String,
+    is_autocompleting: bool,
 }
 
 impl Editor {
@@ -51,11 +68,23 @@ impl Editor {
             history_index: -1,
             paste_buffer: String::new(),
             is_in_paste: false,
+            autocomplete_provider: None,
+            autocomplete_list: None,
+            autocomplete_prefix: String::new(),
+            is_autocompleting: false,
         }
     }
 
     pub fn set_theme(&mut self, theme: EditorTheme) {
         self.theme = theme;
+    }
+
+    pub fn set_autocomplete_provider(&mut self, provider: CombinedAutocompleteProvider) {
+        self.autocomplete_provider = Some(provider);
+    }
+
+    pub fn is_autocompleting(&self) -> bool {
+        self.is_autocompleting
     }
 
     pub fn add_to_history(&mut self, text: &str) {
@@ -105,6 +134,14 @@ impl Editor {
         }
 
         result.push(border);
+
+        // Add autocomplete list if active
+        if self.is_autocompleting {
+            if let Some(ref list) = self.autocomplete_list {
+                result.extend(list.render(width));
+            }
+        }
+
         result
     }
 
@@ -578,6 +615,161 @@ impl Editor {
             let value = self.history[self.history_index as usize].clone();
             self.set_text_internal(&value);
         }
+    }
+
+    // =========================================================================
+    // Autocomplete Methods
+    // =========================================================================
+
+    /// Try to trigger autocomplete based on current cursor position.
+    /// Returns true if autocomplete was triggered.
+    pub fn try_trigger_autocomplete(&mut self) -> bool {
+        let Some(ref provider) = self.autocomplete_provider else {
+            return false;
+        };
+
+        let suggestions = provider.get_suggestions(
+            &self.state.lines,
+            self.state.cursor_line,
+            self.state.cursor_col,
+        );
+
+        if let Some(suggestions) = suggestions {
+            if !suggestions.items.is_empty() {
+                self.autocomplete_prefix = suggestions.prefix;
+                self.autocomplete_list = Some(SelectList::new(
+                    suggestions.items,
+                    5,
+                    self.theme.select_list,
+                ));
+                self.is_autocompleting = true;
+                return true;
+            }
+        }
+
+        self.cancel_autocomplete();
+        false
+    }
+
+    /// Force file autocomplete (called on Tab).
+    pub fn try_force_file_autocomplete(&mut self) -> bool {
+        let Some(ref provider) = self.autocomplete_provider else {
+            return false;
+        };
+
+        let suggestions = provider.get_force_file_suggestions(
+            &self.state.lines,
+            self.state.cursor_line,
+            self.state.cursor_col,
+        );
+
+        if let Some(suggestions) = suggestions {
+            if !suggestions.items.is_empty() {
+                self.autocomplete_prefix = suggestions.prefix;
+                self.autocomplete_list = Some(SelectList::new(
+                    suggestions.items,
+                    5,
+                    self.theme.select_list,
+                ));
+                self.is_autocompleting = true;
+                return true;
+            }
+        }
+
+        self.cancel_autocomplete();
+        false
+    }
+
+    /// Update autocomplete suggestions based on current text.
+    #[allow(dead_code)]
+    fn update_autocomplete(&mut self) {
+        if !self.is_autocompleting {
+            return;
+        }
+
+        let Some(ref provider) = self.autocomplete_provider else {
+            self.cancel_autocomplete();
+            return;
+        };
+
+        let suggestions = provider.get_suggestions(
+            &self.state.lines,
+            self.state.cursor_line,
+            self.state.cursor_col,
+        );
+
+        if let Some(suggestions) = suggestions {
+            if !suggestions.items.is_empty() {
+                self.autocomplete_prefix = suggestions.prefix;
+                self.autocomplete_list = Some(SelectList::new(
+                    suggestions.items,
+                    5,
+                    self.theme.select_list,
+                ));
+                return;
+            }
+        }
+
+        self.cancel_autocomplete();
+    }
+
+    /// Cancel autocomplete.
+    pub fn cancel_autocomplete(&mut self) {
+        self.is_autocompleting = false;
+        self.autocomplete_list = None;
+        self.autocomplete_prefix.clear();
+    }
+
+    /// Move autocomplete selection up.
+    pub fn autocomplete_up(&mut self) {
+        if let Some(ref mut list) = self.autocomplete_list {
+            list.move_up();
+        }
+    }
+
+    /// Move autocomplete selection down.
+    pub fn autocomplete_down(&mut self) {
+        if let Some(ref mut list) = self.autocomplete_list {
+            list.move_down();
+        }
+    }
+
+    /// Apply the selected autocomplete item.
+    /// Returns the value of the applied item if successful.
+    pub fn apply_autocomplete(&mut self) -> Option<String> {
+        let provider = self.autocomplete_provider.as_ref()?;
+        let list = self.autocomplete_list.as_ref()?;
+        let item = list.get_selected_item()?;
+
+        let (new_lines, new_cursor_line, new_cursor_col) = provider.apply_completion(
+            &self.state.lines,
+            self.state.cursor_line,
+            self.state.cursor_col,
+            item,
+            &self.autocomplete_prefix,
+        );
+
+        let value = item.value.clone();
+
+        self.state.lines = new_lines;
+        self.state.cursor_line = new_cursor_line;
+        self.state.cursor_col = new_cursor_col;
+
+        self.cancel_autocomplete();
+        Some(value)
+    }
+
+    /// Check if cursor is at the start of a line (for detecting slash commands).
+    #[allow(dead_code)]
+    fn is_at_line_start(&self) -> bool {
+        let current_line = self
+            .state
+            .lines
+            .get(self.state.cursor_line)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let before_cursor = &current_line[..self.state.cursor_col];
+        before_cursor.trim().is_empty() || before_cursor.trim() == "/"
     }
 }
 

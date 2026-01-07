@@ -14,15 +14,150 @@ pub struct AutocompleteSuggestions {
     pub prefix: String,
 }
 
+/// A slash command that can be autocompleted in the editor.
+#[derive(Clone, Debug)]
+pub struct SlashCommand {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+impl SlashCommand {
+    pub fn new(name: impl Into<String>, description: impl Into<Option<String>>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
 pub struct CombinedAutocompleteProvider {
+    commands: Vec<SlashCommand>,
     base_path: PathBuf,
 }
 
 impl CombinedAutocompleteProvider {
-    pub fn new(base_path: impl Into<PathBuf>) -> Self {
+    pub fn new(commands: Vec<SlashCommand>, base_path: impl Into<PathBuf>) -> Self {
         Self {
+            commands,
             base_path: base_path.into(),
         }
+    }
+
+    /// Get autocomplete suggestions for the current editor state.
+    /// Returns suggestions for slash commands when at the start of input with `/`,
+    /// or file path suggestions otherwise.
+    pub fn get_suggestions(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> Option<AutocompleteSuggestions> {
+        let current_line = lines.get(cursor_line).map(String::as_str).unwrap_or("");
+        let text_before_cursor = slice_to_boundary(current_line, cursor_col);
+
+        // Check for @ file reference (fuzzy search) - must be after a space or at start
+        if let Some(at_match) = extract_at_prefix(text_before_cursor) {
+            let items = self.get_file_suggestions(&at_match);
+            if items.is_empty() {
+                return None;
+            }
+            return Some(AutocompleteSuggestions {
+                items,
+                prefix: at_match,
+            });
+        }
+
+        // Check for slash commands at the start of input
+        if let Some(prefix) = text_before_cursor.strip_prefix('/') {
+            let space_index = text_before_cursor.find(' ');
+
+            if space_index.is_none() {
+                // No space yet - complete command names
+                // Remove the "/"
+                let prefix_lower = prefix.to_lowercase();
+
+                let items: Vec<AutocompleteItem> = self
+                    .commands
+                    .iter()
+                    .filter(|cmd| cmd.name.to_lowercase().starts_with(&prefix_lower))
+                    .map(|cmd| AutocompleteItem {
+                        value: cmd.name.clone(),
+                        label: cmd.name.clone(),
+                        description: cmd.description.clone(),
+                    })
+                    .collect();
+
+                if items.is_empty() {
+                    return None;
+                }
+
+                return Some(AutocompleteSuggestions {
+                    items,
+                    prefix: text_before_cursor.to_string(),
+                });
+            }
+
+            // Space found - could complete command arguments in the future
+            // For now, just return None for command arguments
+            return None;
+        }
+
+        // Check for file paths
+        let path_match = self.extract_path_prefix(text_before_cursor, false)?;
+        let items = self.get_file_suggestions(&path_match);
+        if items.is_empty() {
+            return None;
+        }
+
+        Some(AutocompleteSuggestions {
+            items,
+            prefix: path_match,
+        })
+    }
+
+    /// Apply a selected autocomplete item to the editor text.
+    /// Returns the new lines and cursor position.
+    pub fn apply_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        item: &AutocompleteItem,
+        prefix: &str,
+    ) -> (Vec<String>, usize, usize) {
+        let current_line = lines.get(cursor_line).cloned().unwrap_or_default();
+        let before_prefix = &current_line[..cursor_col.saturating_sub(prefix.len())];
+        let after_cursor = &current_line[cursor_col..];
+
+        // Check if we're completing a slash command
+        let is_slash_command = prefix.starts_with('/')
+            && before_prefix.trim().is_empty()
+            && !prefix[1..].contains('/');
+
+        if is_slash_command {
+            // This is a command name completion - add "/" prefix and space after
+            let new_line = format!("{before_prefix}/{} {after_cursor}", item.value);
+            let mut new_lines = lines.to_vec();
+            new_lines[cursor_line] = new_line;
+            let new_col = before_prefix.len() + item.value.len() + 2; // +2 for "/" and space
+            return (new_lines, cursor_line, new_col);
+        }
+
+        // Check if we're completing a file attachment (prefix starts with "@")
+        if prefix.starts_with('@') {
+            let new_line = format!("{before_prefix}{} {after_cursor}", item.value);
+            let mut new_lines = lines.to_vec();
+            new_lines[cursor_line] = new_line;
+            let new_col = before_prefix.len() + item.value.len() + 1; // +1 for space
+            return (new_lines, cursor_line, new_col);
+        }
+
+        // For file paths, complete the path
+        let new_line = format!("{before_prefix}{}{after_cursor}", item.value);
+        let mut new_lines = lines.to_vec();
+        new_lines[cursor_line] = new_line;
+        let new_col = before_prefix.len() + item.value.len();
+        (new_lines, cursor_line, new_col)
     }
 
     pub fn get_force_file_suggestions(

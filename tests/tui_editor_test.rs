@@ -624,6 +624,7 @@ fn handles_single_word_that_fits_exactly() {
 fn default_editor_theme() -> EditorTheme {
     EditorTheme {
         border_color: identity_color,
+        select_list: pi::tui::SelectListTheme::default(),
     }
 }
 

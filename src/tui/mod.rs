@@ -4,12 +4,14 @@ pub mod keys;
 pub mod terminal_image;
 pub mod utils;
 
-pub use autocomplete::{AutocompleteItem, AutocompleteSuggestions, CombinedAutocompleteProvider};
+pub use autocomplete::{
+    AutocompleteItem, AutocompleteSuggestions, CombinedAutocompleteProvider, SlashCommand,
+};
 pub use components::{
     Component, Container, DefaultTextStyle, Editor, EditorTheme, Expandable, ExpandableText,
-    FilterMode, Image, ImageOptions, ImageTheme, Markdown, MarkdownTheme, SessionList,
-    SessionSelectorComponent, Spacer, Text, ToolPreviewConfig, TreeList, TreeSelectorComponent,
-    TruncatedText,
+    FilterMode, Image, ImageOptions, ImageTheme, Markdown, MarkdownTheme, SelectList,
+    SelectListTheme, SessionList, SessionSelectorComponent, Spacer, Text, ToolPreviewConfig,
+    TreeList, TreeSelectorComponent, TruncatedText,
 };
 pub use keys::{is_kitty_protocol_active, matches_key, parse_key, set_kitty_protocol_active};
 pub use terminal_image::{

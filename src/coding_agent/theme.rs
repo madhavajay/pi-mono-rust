@@ -1,5 +1,5 @@
 use crate::config;
-use crate::tui::{EditorTheme, MarkdownTheme};
+use crate::tui::{EditorTheme, MarkdownTheme, SelectListTheme};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -199,6 +199,17 @@ impl Theme {
     pub fn editor_theme(&self) -> EditorTheme {
         EditorTheme {
             border_color: editor_border_color,
+            select_list: self.select_list_theme(),
+        }
+    }
+
+    pub fn select_list_theme(&self) -> SelectListTheme {
+        SelectListTheme {
+            selected_prefix: |s| format!("\x1b[1m{s}\x1b[0m"),
+            selected_text: |s| format!("\x1b[7m{s}\x1b[0m"),
+            description: |s| format!("\x1b[2m{s}\x1b[0m"),
+            scroll_info: |s| format!("\x1b[2m{s}\x1b[0m"),
+            no_match: |s| format!("\x1b[2m{s}\x1b[0m"),
         }
     }
 
