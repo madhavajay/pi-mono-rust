@@ -9,6 +9,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::agent::{AgentEvent, AgentMessage, AgentStateOverride, LlmContext, Model as AgentModel};
+use crate::api::google_gemini_cli::{
+    stream_google_gemini_cli, GeminiCliCallOptions, GeminiCliTool,
+};
 use crate::api::openai_codex::{stream_openai_codex_responses, CodexStreamOptions, CodexTool};
 use crate::api::{
     build_anthropic_messages, openai_context_to_input_items, stream_anthropic,
@@ -780,8 +783,20 @@ fn build_py_stream_fn(
         "anthropic-messages" => Ok(build_anthropic_stream_fn(model, api_key, use_oauth)),
         "openai-responses" => Ok(build_openai_stream_fn(model, api_key)),
         "openai-codex-responses" => Ok(build_codex_stream_fn(model, api_key)),
+        "google-gemini-cli" => {
+            // Gemini uses resolve_google_gemini_cli_credentials which expects JSON with token/projectId
+            let (access_token, project_id) =
+                crate::cli::auth::resolve_google_gemini_cli_credentials(Some(&api_key))
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "Failed to resolve Gemini credentials: {}",
+                            e
+                        ))
+                    })?;
+            Ok(build_gemini_stream_fn(model, access_token, project_id))
+        }
         api => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "Unsupported API type: '{}'. Supported: anthropic-messages, openai-responses, openai-codex-responses",
+            "Unsupported API type: '{}'. Supported: anthropic-messages, openai-responses, openai-codex-responses, google-gemini-cli",
             api
         ))),
     }
@@ -888,6 +903,47 @@ fn build_codex_stream_fn(model: RegistryModel, api_key: String) -> AgentStreamFn
                 codex_mode: Some(true),
                 extra_headers: model.headers.clone(),
                 ..Default::default()
+            },
+            events,
+        );
+
+        match response {
+            Ok(response) => response,
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
+fn build_gemini_stream_fn(
+    model: RegistryModel,
+    access_token: String,
+    project_id: String,
+) -> AgentStreamFn {
+    Box::new(move |_agent_model, context, events| {
+        // No tools in basic chat mode for now
+        let tool_specs: Vec<GeminiCliTool> = vec![];
+
+        let system = if context.system_prompt.trim().is_empty() {
+            None
+        } else {
+            Some(context.system_prompt.as_str())
+        };
+
+        let response = stream_google_gemini_cli(
+            &model,
+            context,
+            GeminiCliCallOptions {
+                model: &model.id,
+                access_token: &access_token,
+                project_id: &project_id,
+                tools: &tool_specs,
+                base_url: if model.base_url.is_empty() {
+                    ""
+                } else {
+                    model.base_url.as_str()
+                },
+                system,
+                thinking_enabled: model.reasoning,
             },
             events,
         );
