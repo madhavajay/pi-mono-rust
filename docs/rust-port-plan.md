@@ -297,11 +297,16 @@ Planned modules (initial, not final):
   - `src/python/mod.rs`: Python bindings for embedding pi-mono-rust in Python applications.
   - `PyAuthStorage`: Wrapper for credential storage (get/set/remove/list/reload).
   - `PyAgentSession`: Wrapper for agent sessions (prompt, subscribe, abort, session management).
+  - **API streaming integration**: PyAgentSession now properly wires up real API streaming for:
+    - Anthropic Messages API (via `build_anthropic_stream_fn`)
+    - OpenAI Responses API (via `build_openai_stream_fn`)
+    - OpenAI Codex Responses API (via `build_codex_stream_fn`)
   - OAuth helper functions: `anthropic_get_auth_url`, `anthropic_exchange_code`, `anthropic_refresh_token`.
   - OAuth helper functions: `openai_codex_get_auth_url`, `openai_codex_exchange_code`, `openai_codex_refresh_token`.
   - Event streaming: Python callbacks receive session events as dicts (agent events, compaction events).
   - All classes marked `unsendable` for single-threaded use (matching Rc/RefCell internals).
-  - Build: `cargo build --features python` produces `_pi_mono` Python extension module.
+  - Build: `maturin develop --features python` (in pi-mono-rust directory with a Python venv).
+  - Note: Tools not yet wired in PyO3 (basic chat mode only; tool support TODO).
 
 ## Remaining Gaps (Accurate as of 2026-01-07)
 

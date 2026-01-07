@@ -8,16 +8,24 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use crate::agent::{AgentEvent, AgentMessage, AgentStateOverride, Model as AgentModel};
+use crate::agent::{AgentEvent, AgentMessage, AgentStateOverride, LlmContext, Model as AgentModel};
+use crate::api::openai_codex::{stream_openai_codex_responses, CodexStreamOptions, CodexTool};
+use crate::api::{
+    build_anthropic_messages, openai_context_to_input_items, stream_anthropic,
+    stream_openai_responses, AnthropicCallOptions, AnthropicTool, OpenAICallOptions, OpenAITool,
+};
 use crate::coding_agent::{
     AgentSession, AgentSessionConfig, AgentSessionEvent, AuthCredential, AuthStorage,
-    ModelRegistry, SettingsManager,
+    Model as RegistryModel, ModelRegistry, SettingsManager,
 };
-use crate::core::messages::{ContentBlock, UserContent};
+use crate::core::messages::{AssistantMessage, ContentBlock, UserContent};
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+
+/// The default system prompt prefix required for OAuth tokens.
+const DEFAULT_OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, an AI assistant made by Anthropic.";
 
 /// Python wrapper for AuthStorage
 ///
@@ -149,24 +157,16 @@ fn py_to_credential(dict: &Bound<'_, PyDict>) -> PyResult<AuthCredential> {
                     PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'access' field")
                 })?
                 .extract()?;
-            let refresh: Option<String> = dict
-                .get_item("refresh")?
-                .and_then(|v| v.extract().ok());
-            let expires: Option<i64> = dict
-                .get_item("expires")?
-                .and_then(|v| v.extract().ok());
+            let refresh: Option<String> = dict.get_item("refresh")?.and_then(|v| v.extract().ok());
+            let expires: Option<i64> = dict.get_item("expires")?.and_then(|v| v.extract().ok());
             let enterprise_url: Option<String> = dict
                 .get_item("enterprise_url")?
                 .and_then(|v| v.extract().ok());
-            let project_id: Option<String> = dict
-                .get_item("project_id")?
-                .and_then(|v| v.extract().ok());
-            let email: Option<String> = dict
-                .get_item("email")?
-                .and_then(|v| v.extract().ok());
-            let account_id: Option<String> = dict
-                .get_item("account_id")?
-                .and_then(|v| v.extract().ok());
+            let project_id: Option<String> =
+                dict.get_item("project_id")?.and_then(|v| v.extract().ok());
+            let email: Option<String> = dict.get_item("email")?.and_then(|v| v.extract().ok());
+            let account_id: Option<String> =
+                dict.get_item("account_id")?.and_then(|v| v.extract().ok());
             Ok(AuthCredential::OAuth {
                 access,
                 refresh,
@@ -220,7 +220,7 @@ impl PyAgentSession {
         let model_registry = ModelRegistry::new(auth_storage, None::<PathBuf>);
 
         // Determine provider and model
-        let provider = provider
+        let provider_str = provider
             .map(String::from)
             .or_else(|| settings_manager.get_default_provider())
             .unwrap_or_else(|| "anthropic".to_string());
@@ -230,23 +230,35 @@ impl PyAgentSession {
 
         // Find the model in registry
         let registry_model = if let Some(model_id) = &model_id {
-            model_registry.find(&provider, model_id)
+            model_registry.find(&provider_str, model_id)
         } else {
             // Get first available model for provider
             model_registry
                 .get_available()
                 .into_iter()
-                .find(|m| m.provider == provider)
+                .find(|m| m.provider == provider_str)
         };
 
         let registry_model = registry_model.ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "No model found for provider '{}'",
-                provider
+                provider_str
             ))
         })?;
 
-        // Create the agent
+        // Get API key for this model
+        let api_key = model_registry.get_api_key(&registry_model).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "No API key found for provider '{}'. Run authentication first.",
+                provider_str
+            ))
+        })?;
+        let use_oauth = model_registry.is_using_oauth(&registry_model);
+
+        // Build the streaming function based on the API type
+        let stream_fn = build_py_stream_fn(registry_model.clone(), api_key.clone(), use_oauth)?;
+
+        // Create the agent model
         let agent_model = AgentModel {
             id: registry_model.id.clone(),
             name: registry_model.name.clone(),
@@ -254,7 +266,7 @@ impl PyAgentSession {
             provider: registry_model.provider.clone(),
         };
 
-        // Create Agent with initial state override
+        // Create Agent with initial state override and streaming function
         let initial_state = AgentStateOverride {
             model: Some(agent_model),
             ..Default::default()
@@ -262,6 +274,7 @@ impl PyAgentSession {
 
         let agent = crate::agent::Agent::new(crate::agent::AgentOptions {
             initial_state: Some(initial_state),
+            stream_fn: Some(stream_fn),
             ..Default::default()
         });
 
@@ -471,7 +484,8 @@ fn agent_event_to_py(py: Python<'_>, event: &AgentEvent) -> PyObject {
             message,
             tool_results,
         } => {
-            dict.set_item("message", message_to_py(py, message)).unwrap();
+            dict.set_item("message", message_to_py(py, message))
+                .unwrap();
             let results: Vec<PyObject> = tool_results
                 .iter()
                 .map(|r| tool_result_to_py(py, r))
@@ -482,7 +496,8 @@ fn agent_event_to_py(py: Python<'_>, event: &AgentEvent) -> PyObject {
         AgentEvent::MessageStart { message }
         | AgentEvent::MessageUpdate { message }
         | AgentEvent::MessageEnd { message } => {
-            dict.set_item("message", message_to_py(py, message)).unwrap();
+            dict.set_item("message", message_to_py(py, message))
+                .unwrap();
         }
         AgentEvent::ToolExecutionStart {
             tool_call_id,
@@ -502,8 +517,11 @@ fn agent_event_to_py(py: Python<'_>, event: &AgentEvent) -> PyObject {
             dict.set_item("tool_call_id", tool_call_id).unwrap();
             dict.set_item("tool_name", tool_name).unwrap();
             dict.set_item("args", args.to_string()).unwrap();
-            dict.set_item("partial_result", tool_result_inner_to_py(py, partial_result))
-                .unwrap();
+            dict.set_item(
+                "partial_result",
+                tool_result_inner_to_py(py, partial_result),
+            )
+            .unwrap();
         }
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
@@ -545,8 +563,7 @@ fn message_to_py(py: Python<'_>, message: &AgentMessage) -> PyObject {
             dict.set_item("timestamp", assistant.timestamp).unwrap();
         }
         AgentMessage::ToolResult(result) => {
-            dict.set_item("tool_call_id", &result.tool_call_id)
-                .unwrap();
+            dict.set_item("tool_call_id", &result.tool_call_id).unwrap();
             dict.set_item("tool_name", &result.tool_name).unwrap();
             let content: Vec<PyObject> = result
                 .content
@@ -640,7 +657,8 @@ fn tool_result_inner_to_py(py: Python<'_>, result: &crate::agent::AgentToolResul
         .collect();
     dict.set_item("content", PyList::new(py, content).unwrap())
         .unwrap();
-    dict.set_item("details", result.details.to_string()).unwrap();
+    dict.set_item("details", result.details.to_string())
+        .unwrap();
     dict.into()
 }
 
@@ -661,10 +679,7 @@ fn anthropic_get_auth_url() -> (String, String) {
 #[pyfunction]
 fn anthropic_exchange_code(code: &str, verifier: &str) -> PyResult<PyObject> {
     let creds = crate::coding_agent::anthropic_exchange_code(code, verifier).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to exchange code: {}",
-            e
-        ))
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to exchange code: {}", e))
     })?;
 
     Python::with_gil(|py| {
@@ -689,10 +704,7 @@ fn anthropic_exchange_code(code: &str, verifier: &str) -> PyResult<PyObject> {
 #[pyfunction]
 fn anthropic_refresh_token(refresh_token: &str) -> PyResult<PyObject> {
     let creds = crate::coding_agent::anthropic_refresh_token(refresh_token).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to refresh token: {}",
-            e
-        ))
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to refresh token: {}", e))
     })?;
 
     Python::with_gil(|py| {
@@ -717,10 +729,7 @@ fn openai_codex_get_auth_url() -> (String, String, String) {
 #[pyfunction]
 fn openai_codex_exchange_code(code: &str, verifier: &str) -> PyResult<PyObject> {
     let creds = crate::coding_agent::openai_codex_exchange_code(code, verifier).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to exchange code: {}",
-            e
-        ))
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to exchange code: {}", e))
     })?;
 
     Python::with_gil(|py| {
@@ -736,10 +745,7 @@ fn openai_codex_exchange_code(code: &str, verifier: &str) -> PyResult<PyObject> 
 #[pyfunction]
 fn openai_codex_refresh_token(refresh_token: &str) -> PyResult<PyObject> {
     let creds = crate::coding_agent::openai_codex_refresh_token(refresh_token).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to refresh token: {}",
-            e
-        ))
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to refresh token: {}", e))
     })?;
 
     Python::with_gil(|py| {
@@ -755,6 +761,179 @@ fn openai_codex_refresh_token(refresh_token: &str) -> PyResult<PyObject> {
 #[pyfunction]
 fn get_agent_dir() -> String {
     crate::config::get_agent_dir().to_string_lossy().to_string()
+}
+
+// ============================================================================
+// API streaming function builders
+// ============================================================================
+
+type AgentStreamFn =
+    Box<dyn FnMut(&AgentModel, &LlmContext, &mut crate::agent::StreamEvents) -> AssistantMessage>;
+
+/// Build a streaming function based on the model's API type.
+fn build_py_stream_fn(
+    model: RegistryModel,
+    api_key: String,
+    use_oauth: bool,
+) -> PyResult<AgentStreamFn> {
+    match model.api.as_str() {
+        "anthropic-messages" => Ok(build_anthropic_stream_fn(model, api_key, use_oauth)),
+        "openai-responses" => Ok(build_openai_stream_fn(model, api_key)),
+        "openai-codex-responses" => Ok(build_codex_stream_fn(model, api_key)),
+        api => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Unsupported API type: '{}'. Supported: anthropic-messages, openai-responses, openai-codex-responses",
+            api
+        ))),
+    }
+}
+
+fn build_anthropic_stream_fn(
+    model: RegistryModel,
+    api_key: String,
+    use_oauth: bool,
+) -> AgentStreamFn {
+    Box::new(move |_agent_model, context, events| {
+        // OAuth tokens require the Claude Code identification in the system prompt
+        let system_with_oauth_prefix = if use_oauth {
+            if context.system_prompt.trim().is_empty() {
+                DEFAULT_OAUTH_SYSTEM_PROMPT.to_string()
+            } else {
+                format!(
+                    "{}\n\n{}",
+                    DEFAULT_OAUTH_SYSTEM_PROMPT, context.system_prompt
+                )
+            }
+        } else {
+            context.system_prompt.clone()
+        };
+        let system = if system_with_oauth_prefix.trim().is_empty() {
+            None
+        } else {
+            Some(system_with_oauth_prefix.as_str())
+        };
+
+        let messages = build_anthropic_messages(context);
+
+        // No tools in basic chat mode for now
+        let tool_specs: Vec<AnthropicTool> = vec![];
+
+        let response = stream_anthropic(
+            &model,
+            messages,
+            AnthropicCallOptions {
+                model: &model.id,
+                api_key: &api_key,
+                use_oauth,
+                tools: &tool_specs,
+                base_url: if model.base_url.is_empty() {
+                    "https://api.anthropic.com/v1"
+                } else {
+                    model.base_url.as_str()
+                },
+                extra_headers: model.headers.as_ref(),
+                system,
+            },
+            events,
+        );
+
+        match response {
+            Ok(response) => response,
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
+fn build_openai_stream_fn(model: RegistryModel, api_key: String) -> AgentStreamFn {
+    Box::new(move |_agent_model, context, events| {
+        let input = openai_context_to_input_items(&model, context);
+
+        // No tools in basic chat mode for now
+        let tool_specs: Vec<OpenAITool> = vec![];
+
+        let response = stream_openai_responses(
+            &model,
+            input,
+            OpenAICallOptions {
+                model: &model.id,
+                api_key: &api_key,
+                tools: &tool_specs,
+                base_url: if model.base_url.is_empty() {
+                    "https://api.openai.com/v1"
+                } else {
+                    model.base_url.as_str()
+                },
+                extra_headers: model.headers.as_ref(),
+            },
+            events,
+        );
+
+        match response {
+            Ok(response) => response,
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
+fn build_codex_stream_fn(model: RegistryModel, api_key: String) -> AgentStreamFn {
+    Box::new(move |_agent_model, context, events| {
+        // No tools in basic chat mode for now
+        let tool_specs: Vec<CodexTool> = vec![];
+
+        let response = stream_openai_codex_responses(
+            &model,
+            context,
+            &api_key,
+            &tool_specs,
+            CodexStreamOptions {
+                codex_mode: Some(true),
+                extra_headers: model.headers.clone(),
+                ..Default::default()
+            },
+            events,
+        );
+
+        match response {
+            Ok(response) => response,
+            Err(err) => assistant_error_message(&model, &err),
+        }
+    })
+}
+
+fn assistant_error_message(model: &RegistryModel, error: &str) -> AssistantMessage {
+    use crate::core::messages::{Cost, Usage};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    AssistantMessage {
+        content: vec![ContentBlock::Text {
+            text: String::new(),
+            text_signature: None,
+        }],
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        usage: Usage {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: Some(0),
+            cost: Some(Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.0,
+            }),
+        },
+        stop_reason: "error".to_string(),
+        error_message: Some(error.to_string()),
+        timestamp,
+    }
 }
 
 /// Python module definition
