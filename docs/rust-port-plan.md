@@ -322,7 +322,13 @@ Planned modules (initial, not final):
   - Build: `maturin develop --features python` (in pi-mono-rust directory with a Python venv).
   - **Gemini CLI auth fallback**: `AuthStorage.has_auth()` and `get_api_key()` now detect `~/.gemini/oauth_creds.json` for `google-gemini-cli` provider.
   - **Gemini CLI creds parsing fix**: `expiry_date` field parsed as float (official gemini CLI writes floats, not ints).
-  - Note: Tools not yet wired in PyO3 (basic chat mode only; tool support TODO).
+  - **Tool approval hooks**: Full approval callback integration for tool execution control:
+    - `ApprovalRequest` struct with tool_call_id, tool_name, args, command, cwd, reason fields.
+    - `ApprovalResponse` enum: Approve, ApproveSession, Deny, Abort.
+    - `set_approval_callback()` method on PyAgentSession for Python callbacks.
+    - Session-approved tools tracking (ApproveSession remembers tool for session duration).
+    - Deny response returns error message to model, Abort stops agent loop entirely.
+    - GIL-safe callback invocation via `Python::with_gil()` pattern.
 
 ## Remaining Gaps (Accurate as of 2026-01-07)
 

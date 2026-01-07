@@ -8,7 +8,10 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use crate::agent::{AgentEvent, AgentMessage, AgentStateOverride, LlmContext, Model as AgentModel};
+use crate::agent::{
+    AgentEvent, AgentMessage, AgentStateOverride, ApprovalFn, ApprovalRequest, ApprovalResponse,
+    LlmContext, Model as AgentModel,
+};
 use crate::api::google_gemini_cli::{
     stream_google_gemini_cli, GeminiCliCallOptions, GeminiCliTool,
 };
@@ -197,6 +200,8 @@ pub struct PyAgentSession {
     inner: RefCell<Option<AgentSession>>,
     // Store Python callbacks for event subscription
     callbacks: Rc<RefCell<Vec<PyObject>>>,
+    // Store approval callback (Python function that takes dict and returns string)
+    approval_callback: Rc<RefCell<Option<PyObject>>>,
 }
 
 #[pymethods]
@@ -317,7 +322,104 @@ impl PyAgentSession {
         Ok(Self {
             inner: RefCell::new(Some(session)),
             callbacks,
+            approval_callback: Rc::new(RefCell::new(None)),
         })
+    }
+
+    /// Set the approval callback.
+    ///
+    /// The callback takes a dict with:
+    ///   - tool_call_id: str
+    ///   - tool_name: str
+    ///   - args: str (JSON)
+    ///   - command: str (optional, for bash tools)
+    ///   - cwd: str (optional)
+    ///   - reason: str (optional)
+    ///
+    /// And returns one of: "approve", "approve_session", "deny", "abort"
+    #[pyo3(signature = (callback=None))]
+    fn set_approval_callback(&self, callback: Option<PyObject>) -> PyResult<()> {
+        // Store the callback by moving it
+        let has_callback = callback.is_some();
+        *self.approval_callback.borrow_mut() = callback;
+
+        if !has_callback {
+            // Clear the approval callback on the agent
+            let mut inner = self.inner.borrow_mut();
+            if let Some(session) = inner.as_mut() {
+                session.agent.set_on_approval(None);
+            }
+            return Ok(());
+        }
+
+        // Create a Rust closure that calls the Python callback
+        let py_callback = self.approval_callback.clone();
+        let approval_fn: Box<ApprovalFn> = Box::new(
+            move |request: &ApprovalRequest| -> ApprovalResponse {
+                let callback_ref = py_callback.borrow();
+                let Some(ref callback) = *callback_ref else {
+                    return ApprovalResponse::Approve;
+                };
+
+                Python::with_gil(|py| {
+                    // Create a dict with the request data
+                    let dict = PyDict::new(py);
+                    dict.set_item("tool_call_id", &request.tool_call_id)
+                        .unwrap();
+                    dict.set_item("tool_name", &request.tool_name).unwrap();
+                    dict.set_item("args", request.args.to_string()).unwrap();
+                    if let Some(ref command) = request.command {
+                        dict.set_item("command", command).unwrap();
+                    }
+                    if let Some(ref cwd) = request.cwd {
+                        dict.set_item("cwd", cwd).unwrap();
+                    }
+                    if let Some(ref reason) = request.reason {
+                        dict.set_item("reason", reason).unwrap();
+                    }
+
+                    // Call the Python callback
+                    let result = callback.call1(py, (dict,));
+                    match result {
+                        Ok(response) => {
+                            if let Ok(s) = response.extract::<String>(py) {
+                                match s.as_str() {
+                                    "approve" => ApprovalResponse::Approve,
+                                    "approve_session" => ApprovalResponse::ApproveSession,
+                                    "deny" => ApprovalResponse::Deny,
+                                    "abort" => ApprovalResponse::Abort,
+                                    _ => {
+                                        eprintln!(
+                                            "Unknown approval response '{}', defaulting to approve",
+                                            s
+                                        );
+                                        ApprovalResponse::Approve
+                                    }
+                                }
+                            } else {
+                                eprintln!("Approval callback did not return a string, defaulting to approve");
+                                ApprovalResponse::Approve
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error calling approval callback: {}", e);
+                            ApprovalResponse::Approve
+                        }
+                    }
+                })
+            },
+        );
+
+        // Set the callback on the agent
+        let mut inner = self.inner.borrow_mut();
+        let session = inner.as_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Session has been disposed")
+        })?;
+        session
+            .agent
+            .set_on_approval(Some(Rc::new(RefCell::new(approval_fn))));
+
+        Ok(())
     }
 
     /// Send a prompt to the agent
@@ -537,6 +639,21 @@ fn agent_event_to_py(py: Python<'_>, event: &AgentEvent) -> PyObject {
             dict.set_item("result", tool_result_inner_to_py(py, result))
                 .unwrap();
             dict.set_item("is_error", *is_error).unwrap();
+        }
+        AgentEvent::ApprovalRequest(request) => {
+            dict.set_item("tool_call_id", &request.tool_call_id)
+                .unwrap();
+            dict.set_item("tool_name", &request.tool_name).unwrap();
+            dict.set_item("args", request.args.to_string()).unwrap();
+            if let Some(command) = &request.command {
+                dict.set_item("command", command).unwrap();
+            }
+            if let Some(cwd) = &request.cwd {
+                dict.set_item("cwd", cwd).unwrap();
+            }
+            if let Some(reason) = &request.reason {
+                dict.set_item("reason", reason).unwrap();
+            }
         }
     }
 
