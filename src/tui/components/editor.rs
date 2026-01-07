@@ -32,6 +32,9 @@ pub struct Editor {
     last_width: usize,
     history: Vec<String>,
     history_index: i32,
+    // Bracketed paste mode buffering
+    paste_buffer: String,
+    is_in_paste: bool,
 }
 
 impl Editor {
@@ -46,6 +49,8 @@ impl Editor {
             last_width: 80,
             history: Vec::new(),
             history_index: -1,
+            paste_buffer: String::new(),
+            is_in_paste: false,
         }
     }
 
@@ -104,7 +109,43 @@ impl Editor {
     }
 
     pub fn handle_input(&mut self, data: &str) {
-        match data {
+        // Handle bracketed paste mode
+        // Start of paste: \x1b[200~
+        // End of paste: \x1b[201~
+        let mut input = data.to_string();
+
+        // Check if we're starting a bracketed paste
+        if input.contains("\x1b[200~") {
+            self.is_in_paste = true;
+            self.paste_buffer.clear();
+            input = input.replace("\x1b[200~", "");
+        }
+
+        // If we're in a paste, buffer the data
+        if self.is_in_paste {
+            self.paste_buffer.push_str(&input);
+
+            if let Some(end_index) = self.paste_buffer.find("\x1b[201~") {
+                // Extract the pasted content
+                let paste_content = self.paste_buffer[..end_index].to_string();
+
+                // Process the complete paste
+                self.handle_paste(&paste_content);
+
+                // Reset paste state
+                self.is_in_paste = false;
+
+                // Handle any remaining input after the paste marker
+                let remaining = self.paste_buffer[end_index + 6..].to_string(); // 6 = length of \x1b[201~
+                self.paste_buffer.clear();
+                if !remaining.is_empty() {
+                    self.handle_input(&remaining);
+                }
+            }
+            return;
+        }
+
+        match input.as_str() {
             "\x1b[A" => {
                 if self.is_editor_empty()
                     || (self.history_index > -1 && self.is_on_first_visual_line())
@@ -149,9 +190,16 @@ impl Editor {
                 self.add_new_line();
             }
             _ => {
-                self.insert_text(data);
+                self.insert_text(&input);
             }
         }
+    }
+
+    fn handle_paste(&mut self, pasted_text: &str) {
+        // For multi-line editor, we keep newlines (unlike single-line Input which removes them)
+        // But we still normalize line endings
+        let normalized = pasted_text.replace("\r\n", "\n").replace('\r', "\n");
+        self.insert_text(&normalized);
     }
 
     fn set_text_internal(&mut self, text: &str) {
@@ -170,7 +218,7 @@ impl Editor {
         for grapheme in UnicodeSegmentation::graphemes(text, true) {
             if grapheme == "\n" {
                 self.add_new_line();
-            } else if !grapheme.is_empty() {
+            } else if !grapheme.is_empty() && !has_control_chars(grapheme) {
                 self.insert_character(grapheme);
             }
         }
@@ -545,6 +593,18 @@ fn is_whitespace_grapheme(grapheme: &str) -> bool {
 
 fn is_punctuation_grapheme(grapheme: &str) -> bool {
     grapheme.chars().all(is_punctuation_char)
+}
+
+/// Check if a string contains control characters that should be rejected.
+/// Control characters: C0 (0x00-0x1F except newline), DEL (0x7F), C1 (0x80-0x9F)
+fn has_control_chars(s: &str) -> bool {
+    s.chars().any(|ch| {
+        let code = ch as u32;
+        // C0 control characters (0x00-0x1F) except newline (0x0A)
+        // DEL (0x7F)
+        // C1 control characters (0x80-0x9F)
+        (code < 32 && code != 10) || code == 0x7F || (0x80..=0x9F).contains(&code)
+    })
 }
 
 fn word_wrap_line(line: &str, max_width: usize) -> Vec<TextChunk> {

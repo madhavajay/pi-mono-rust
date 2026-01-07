@@ -220,10 +220,19 @@ Planned modules (initial, not final):
   - `on_theme_change()` callback registration for UI invalidation.
   - `init_theme()` and `set_theme()` with optional watcher enable.
   - Uses `notify` crate for cross-platform file watching.
+- **Editor bracketed paste mode and control character filtering**:
+  - Bracketed paste mode: Handles `\x1b[200~` and `\x1b[201~` markers for proper paste handling.
+  - Multi-chunk paste buffering when paste spans multiple input events.
+  - Line ending normalization (`\r\n` and `\r` to `\n`) during paste.
+  - Control character filtering: Rejects C0 (0x00-0x1F except newline), DEL (0x7F), and C1 (0x80-0x9F) characters.
+  - Tests for paste mode (single/multi-chunk, cursor position, line endings) and control char filtering.
+- **TS extension loading tests**:
+  - Test verifies TypeScript extensions can be loaded via jiti when available.
+  - Falls back gracefully with proper error message when jiti is not installed.
+  - Uses ESM `export default` syntax matching TS test conventions.
 
 ## Remaining Gaps (Next)
-- Interactive TUI parity: input component improvements (cursor handling, etc).
-- TS extensions parity tests (jiti loading already works when jiti is available in project).
+- Interactive TUI parity: Additional input component improvements if needed.
 
 ## Test Plan
 ### Baseline (TS)

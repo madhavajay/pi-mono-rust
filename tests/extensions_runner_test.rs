@@ -301,3 +301,83 @@ fn returns_true_when_handlers_exist() {
     assert!(runner.has_handlers("tool_call"));
     assert!(!runner.has_handlers("agent_end"));
 }
+
+#[test]
+fn loads_typescript_extension_when_jiti_is_available() {
+    // This test verifies that TypeScript extensions can be loaded via jiti.
+    // If jiti is not installed, this test will check the runner warnings.
+    let temp = TempDir::new("pi-runner-test");
+    let extensions_dir = temp.path().join("extensions");
+    fs::create_dir_all(&extensions_dir).expect("create extensions dir");
+
+    // Write a TypeScript extension using ESM syntax (matching TS tests)
+    let ts_ext = r#"
+// TypeScript extension with type annotations
+interface PiAPI {
+    registerTool: (config: { name: string; label: string; description: string }) => void;
+}
+
+export default function(pi: PiAPI): void {
+    pi.registerTool({
+        name: "ts_tool",
+        label: "TypeScript Tool",
+        description: "A tool defined in TypeScript",
+    });
+}
+    "#;
+    let ext_path = write_extension(&extensions_dir, "ts-extension.ts", ts_ext);
+
+    // Try to spawn the runner - it might fail if jiti is not installed
+    let result = ExtensionHost::spawn(std::slice::from_ref(&ext_path), temp.path());
+
+    match result {
+        Ok((host, manifest)) => {
+            // Check if there were any errors loading the extension
+            if !manifest.errors.is_empty() {
+                let error_messages: Vec<&str> =
+                    manifest.errors.iter().map(|e| e.error.as_str()).collect();
+                let has_jiti_error = error_messages
+                    .iter()
+                    .any(|e| e.contains("jiti") || e.contains("TypeScript"));
+                assert!(
+                    has_jiti_error,
+                    "Expected jiti/TypeScript error when loading .ts extension, got errors: {:?}",
+                    error_messages
+                );
+                return;
+            }
+
+            let runner = ExtensionRunner::new(host, manifest);
+
+            // Check for warnings (which include extension load errors)
+            let warnings = runner.warnings();
+            let has_jiti_warning = warnings
+                .iter()
+                .any(|w| w.contains("jiti") || w.contains("TypeScript"));
+
+            if has_jiti_warning {
+                // jiti not available, test passes (we got expected error)
+                return;
+            }
+
+            // jiti is available, verify the tool is registered
+            let tools = runner.get_all_registered_tools();
+            let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(
+                tools.iter().any(|t| t.name == "ts_tool"),
+                "TypeScript extension should register ts_tool, got tools: {:?}, warnings: {:?}",
+                tool_names,
+                warnings
+            );
+        }
+        Err(e) => {
+            // jiti is not available, verify we get the expected error
+            let error_msg = e.to_string();
+            assert!(
+                error_msg.contains("jiti") || error_msg.contains("TypeScript"),
+                "Error should mention jiti or TypeScript requirement, got: {}",
+                error_msg
+            );
+        }
+    }
+}

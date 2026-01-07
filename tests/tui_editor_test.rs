@@ -652,3 +652,147 @@ fn strip_vt_control_characters(text: &str) -> String {
     }
     output
 }
+
+// Bracketed paste mode tests
+#[test]
+fn handles_bracketed_paste_mode_single_chunk() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // Complete paste in one chunk: \x1b[200~ ... \x1b[201~
+    editor.handle_input("\x1b[200~pasted text\x1b[201~");
+
+    assert_eq!(editor.get_text(), "pasted text");
+}
+
+#[test]
+fn handles_bracketed_paste_mode_multiple_chunks() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // Paste split across multiple chunks
+    editor.handle_input("\x1b[200~first ");
+    editor.handle_input("second ");
+    editor.handle_input("third\x1b[201~");
+
+    assert_eq!(editor.get_text(), "first second third");
+}
+
+#[test]
+fn handles_bracketed_paste_with_remaining_input() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // Paste followed by regular input
+    editor.handle_input("\x1b[200~pasted\x1b[201~extra");
+
+    assert_eq!(editor.get_text(), "pastedextra");
+}
+
+#[test]
+fn handles_bracketed_paste_normalizes_line_endings() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // Paste with Windows and Mac line endings
+    editor.handle_input("\x1b[200~line1\r\nline2\rline3\x1b[201~");
+
+    assert_eq!(editor.get_text(), "line1\nline2\nline3");
+}
+
+#[test]
+fn handles_bracketed_paste_preserves_newlines_in_multiline_editor() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // Multi-line paste
+    editor.handle_input("\x1b[200~line1\nline2\nline3\x1b[201~");
+
+    assert_eq!(editor.get_text(), "line1\nline2\nline3");
+}
+
+#[test]
+fn handles_bracketed_paste_at_cursor_position() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    editor.handle_input("before ");
+    editor.handle_input("\x1b[200~middle\x1b[201~");
+    editor.handle_input(" after");
+
+    assert_eq!(editor.get_text(), "before middle after");
+}
+
+// Control character filtering tests
+#[test]
+fn rejects_control_characters_c0_range() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // C0 control characters (0x00-0x1F) except newline (0x0A)
+    // Note: Some control chars like \x01 (Ctrl+A) are handled specially before text insertion
+    // Here we test filtering via bracketed paste mode to bypass special handling
+    editor.handle_input("\x1b[200~a\x00\x02\x03b\x1b[201~"); // NUL, STX, ETX filtered
+    editor.handle_input("c");
+
+    // Should only have "abc" - control chars are filtered
+    assert_eq!(editor.get_text(), "abc");
+}
+
+#[test]
+fn rejects_del_character() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // DEL (0x7F) is a special control character
+    // Note: \x7f is handled as backspace in handle_input match
+    // but if it comes as part of text insertion, it should be filtered
+    editor.handle_input("test");
+    // The direct \x7f is handled as backspace
+    // Let's test filtering in insert_text context
+    editor.set_text("a\x7fb");
+    // set_text_internal doesn't filter, but if we test via insert_text...
+    // Actually set_text goes through set_text_internal which doesn't filter
+    // Control char filtering is in insert_text which is called from handle_input fallback
+
+    // For this test, we verify that direct text input filtering works
+    let mut editor2 = Editor::new(default_editor_theme());
+    editor2.set_text(""); // Reset
+                          // Simulate inserting text with DEL embedded (via paste)
+    editor2.handle_input("\x1b[200~a\x7fb\x1b[201~");
+    assert_eq!(editor2.get_text(), "ab");
+}
+
+#[test]
+fn rejects_c1_control_characters() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // C1 control characters (0x80-0x9F)
+    // These are multi-byte in UTF-8, so we need to be careful
+    // 0x80 = \u{0080}, 0x9F = \u{009F}
+    editor.handle_input("\x1b[200~a\u{0080}b\u{009F}c\x1b[201~");
+
+    assert_eq!(editor.get_text(), "abc");
+}
+
+#[test]
+fn allows_printable_unicode_characters() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // Various printable unicode should be allowed
+    editor.handle_input("Hello ");
+    editor.handle_input("Ä"); // German umlaut
+    editor.handle_input("ö");
+    editor.handle_input(" ");
+    editor.handle_input("日本語"); // Japanese
+    editor.handle_input(" ");
+    editor.handle_input("😀"); // Emoji
+    editor.handle_input(" ");
+    editor.handle_input("αβγ"); // Greek
+
+    assert_eq!(editor.get_text(), "Hello Äö 日本語 😀 αβγ");
+}
+
+#[test]
+fn allows_newline_but_filters_other_c0() {
+    let mut editor = Editor::new(default_editor_theme());
+
+    // Newline (0x0A) is explicitly allowed and creates a new line
+    // But other C0 chars should be filtered
+    editor.handle_input("\x1b[200~line1\n\x08line2\x1b[201~"); // \x08 is backspace char
+
+    // Should have two lines, with backspace filtered
+    assert_eq!(editor.get_text(), "line1\nline2");
+}
