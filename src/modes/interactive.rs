@@ -94,7 +94,8 @@ fn render_interactive_ui(
         if index + 1 == lines.len() {
             write!(stdout, "{truncated}").map_err(|err| err.to_string())?;
         } else {
-            writeln!(stdout, "{truncated}").map_err(|err| err.to_string())?;
+            // Use \r\n to ensure we start at column 0 on next line
+            write!(stdout, "{truncated}\r\n").map_err(|err| err.to_string())?;
         }
     }
     stdout.flush().map_err(|err| err.to_string())?;
