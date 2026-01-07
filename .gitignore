@@ -30,3 +30,6 @@ __pycache__/
 .venv/
 *.egg-info/
 target/
+
+# Session debug dumps
+pi-session-*.html
