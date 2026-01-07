@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod interactive_mode;
 pub mod model_registry;
 pub mod model_resolver;
+pub mod oauth;
 pub mod prompt_templates;
 pub mod skills;
 pub mod slash_commands;
@@ -29,7 +30,7 @@ pub use auth_storage::{AuthCredential, AuthStorage};
 pub use changelog::{get_changelog_path, parse_changelog, ChangelogEntry};
 pub use export_html::{export_from_file, export_session_to_html};
 pub use extension_host::{
-    ExtensionHost, ExtensionManifest, ExtensionUiRequest, ExtensionUiResponse,
+    ExtensionCommand, ExtensionHost, ExtensionManifest, ExtensionUiRequest, ExtensionUiResponse,
 };
 pub use extension_runner::{
     ExtensionRunner, RegisteredCommand, RegisteredFlag, RegisteredMessageRenderer,
@@ -44,6 +45,14 @@ pub use interactive_mode::InteractiveMode;
 pub use model_registry::{Model, ModelRegistry};
 pub use model_resolver::{
     parse_model_pattern, resolve_model_scope, InitialModelResult, ParsedModelResult, ScopedModel,
+};
+pub use oauth::{
+    anthropic_exchange_code, anthropic_get_auth_url, anthropic_refresh_token,
+    get_github_copilot_base_url, get_oauth_providers, github_poll_for_token,
+    github_refresh_copilot_token, github_start_device_flow, normalize_github_domain, open_browser,
+    openai_codex_exchange_code, openai_codex_get_auth_url, openai_codex_login_with_input,
+    openai_codex_refresh_token, DeviceCodeResponse, OAuthCallbackServer, OAuthCredentials,
+    OAuthProviderInfo,
 };
 pub use prompt_templates::{
     expand_prompt_template, load_prompt_templates, LoadPromptTemplatesOptions, PromptTemplate,

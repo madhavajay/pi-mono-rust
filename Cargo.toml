@@ -24,3 +24,7 @@ regex = "1"
 base64 = "0.22"
 crossterm = "0.27"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+rand = "0.9"
+sha2 = "0.10"
+url = "2"
+hex = "0.4"

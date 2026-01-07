@@ -151,6 +151,28 @@ impl ModelRegistry {
         )
     }
 
+    /// Get credential for a provider
+    pub fn get_credential(
+        &self,
+        provider: &str,
+    ) -> Option<&crate::coding_agent::auth_storage::AuthCredential> {
+        self.auth_storage.get(provider)
+    }
+
+    /// Set credential for a provider
+    pub fn set_credential(
+        &mut self,
+        provider: &str,
+        credential: crate::coding_agent::auth_storage::AuthCredential,
+    ) {
+        self.auth_storage.set(provider, credential);
+    }
+
+    /// Remove credential for a provider
+    pub fn remove_credential(&mut self, provider: &str) {
+        self.auth_storage.remove(provider);
+    }
+
     fn load_models(&mut self) {
         let custom = if let Some(path) = self.models_json_path.clone() {
             self.load_custom_models(&path).unwrap_or_default()
@@ -336,7 +358,10 @@ fn model_from_builtin(model: &BuiltInModelDefinition) -> Model {
         output: model.cost.output,
         cache_read: model.cost.cache_read,
         cache_write: model.cost.cache_write,
-        total: model.cost.input + model.cost.output + model.cost.cache_read + model.cost.cache_write,
+        total: model.cost.input
+            + model.cost.output
+            + model.cost.cache_read
+            + model.cost.cache_write,
     };
     Model {
         id: model.id.clone(),

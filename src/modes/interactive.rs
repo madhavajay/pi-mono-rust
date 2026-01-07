@@ -3,12 +3,20 @@ use crate::cli::file_inputs::FileInputImage;
 use crate::cli::session::to_agent_model;
 use crate::coding_agent::interactive_mode::format_message_for_interactive;
 use crate::coding_agent::{
-    available_themes, get_changelog_path, load_theme_or_default, parse_changelog,
-    parse_model_pattern, set_active_theme, AgentSession,
+    anthropic_exchange_code, anthropic_get_auth_url, available_themes, get_changelog_path,
+    get_oauth_providers, load_theme_or_default, open_browser, openai_codex_get_auth_url,
+    openai_codex_login_with_input, parse_changelog, parse_model_pattern, set_active_theme,
+    AgentSession, AuthCredential, BranchCandidate, OAuthCallbackServer,
 };
 use crate::core::messages::UserContent;
+use crate::core::session_manager::SessionManager;
 use crate::tui::{
-    truncate_to_width, wrap_text_with_ansi, CombinedAutocompleteProvider, Editor, SlashCommand,
+    bool_values, double_escape_action_values, matches_key, queue_mode_values,
+    thinking_level_values, truncate_to_width, wrap_text_with_ansi, CombinedAutocompleteProvider,
+    Editor, LoginDialogComponent, LoginDialogResult, ModelItem, ModelSelectorComponent,
+    ModelSelectorResult, OAuthSelectorComponent, OAuthSelectorMode, OAuthSelectorResult,
+    SessionSelectorComponent, SettingItem, SettingValue, SettingsSelectorComponent,
+    SettingsSelectorResult, SlashCommand, TreeSelectorComponent,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -47,6 +55,224 @@ enum EditorAction {
     Submit,
     Exit,
     Continue,
+}
+
+/// Modal UI state for selectors
+enum ModalState {
+    None,
+    TreeSelector(TreeSelectorState),
+    SessionSelector(SessionSelectorState),
+    BranchSelector(BranchSelectorState),
+    ModelSelector(ModelSelectorState),
+    SettingsSelector(SettingsSelectorState),
+    OAuthSelector(OAuthSelectorState),
+    LoginDialog(LoginDialogSelectorState),
+}
+
+struct TreeSelectorState {
+    selector: TreeSelectorComponent,
+    result: Option<TreeSelectorResult>,
+}
+
+enum TreeSelectorResult {
+    Selected(String),
+    Cancelled,
+}
+
+struct SessionSelectorState {
+    selector: SessionSelectorComponent,
+    result: Option<SessionSelectorResult>,
+}
+
+enum SessionSelectorResult {
+    Selected(PathBuf),
+    Cancelled,
+}
+
+struct BranchSelectorState {
+    candidates: Vec<BranchCandidate>,
+    selected_index: usize,
+    search_query: String,
+    filtered_indices: Vec<usize>,
+    result: Option<BranchSelectorResult>,
+}
+
+impl BranchSelectorState {
+    fn new(candidates: Vec<BranchCandidate>) -> Self {
+        let filtered_indices = (0..candidates.len()).collect();
+        Self {
+            candidates,
+            selected_index: 0,
+            search_query: String::new(),
+            filtered_indices,
+            result: None,
+        }
+    }
+
+    fn filter(&mut self) {
+        let query = self.search_query.to_lowercase();
+        if query.is_empty() {
+            self.filtered_indices = (0..self.candidates.len()).collect();
+        } else {
+            self.filtered_indices = self
+                .candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.text.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        if self.selected_index >= self.filtered_indices.len() {
+            self.selected_index = self.filtered_indices.len().saturating_sub(1);
+        }
+    }
+
+    fn handle_input(&mut self, key_data: &str) {
+        if matches_key(key_data, "up") {
+            if self.selected_index > 0 {
+                self.selected_index -= 1;
+            }
+        } else if matches_key(key_data, "down") {
+            if self.selected_index + 1 < self.filtered_indices.len() {
+                self.selected_index += 1;
+            }
+        } else if matches_key(key_data, "enter") {
+            if let Some(&idx) = self.filtered_indices.get(self.selected_index) {
+                let entry_id = self.candidates[idx].entry_id.clone();
+                self.result = Some(BranchSelectorResult::Selected(entry_id));
+            }
+        } else if matches_key(key_data, "escape") {
+            self.result = Some(BranchSelectorResult::Cancelled);
+        } else if matches_key(key_data, "backspace") {
+            self.search_query.pop();
+            self.filter();
+        } else if key_data.len() == 1 {
+            let ch = key_data.chars().next().unwrap();
+            if ch.is_ascii_graphic() || ch == ' ' {
+                self.search_query.push(ch);
+                self.filter();
+            }
+        }
+    }
+
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = vec![
+            "─".repeat(width.min(80)),
+            "  Branch from Message".to_string(),
+            "  Select a message to create a new branch from that point".to_string(),
+            String::new(),
+        ];
+
+        // Search
+        let search_line = format!(
+            "  \x1b[2mSearch:\x1b[0m {}{}",
+            self.search_query,
+            if self.search_query.is_empty() {
+                "\x1b[2m_\x1b[0m"
+            } else {
+                "_"
+            }
+        );
+        lines.push(truncate_to_width(&search_line, width));
+        lines.push(String::new());
+
+        if self.filtered_indices.is_empty() {
+            lines.push("  \x1b[2mNo messages found\x1b[0m".to_string());
+        } else {
+            let max_visible = 10;
+            let start = if self.filtered_indices.len() <= max_visible {
+                0
+            } else {
+                let half = max_visible / 2;
+                let max_start = self.filtered_indices.len() - max_visible;
+                self.selected_index.saturating_sub(half).min(max_start)
+            };
+            let end = (start + max_visible).min(self.filtered_indices.len());
+
+            for (display_idx, &original_idx) in self.filtered_indices[start..end].iter().enumerate()
+            {
+                let candidate = &self.candidates[original_idx];
+                let is_selected = display_idx + start == self.selected_index;
+                let cursor = if is_selected {
+                    "\x1b[36m› \x1b[0m"
+                } else {
+                    "  "
+                };
+                let text = candidate.text.replace('\n', " ");
+                let text = truncate_to_width(&text, width.saturating_sub(4));
+                let line = if is_selected {
+                    format!("{}\x1b[1m{}\x1b[0m", cursor, text)
+                } else {
+                    format!("{}{}", cursor, text)
+                };
+                lines.push(line);
+            }
+
+            // Position indicator
+            if self.filtered_indices.len() > max_visible {
+                lines.push(format!(
+                    "  \x1b[2m({}/{})\x1b[0m",
+                    self.selected_index + 1,
+                    self.filtered_indices.len()
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("─".repeat(width.min(80)));
+
+        lines
+    }
+}
+
+enum BranchSelectorResult {
+    Selected(String),
+    Cancelled,
+}
+
+struct ModelSelectorState {
+    selector: ModelSelectorComponent,
+}
+
+struct SettingsSelectorState {
+    selector: SettingsSelectorComponent,
+}
+
+struct OAuthSelectorState {
+    selector: OAuthSelectorComponent,
+    mode: OAuthSelectorMode,
+}
+
+struct LoginDialogSelectorState {
+    dialog: LoginDialogComponent,
+    provider_id: String,
+    // State for the OAuth flow
+    oauth_state: OAuthFlowState,
+}
+
+#[allow(dead_code)]
+enum OAuthFlowState {
+    // Anthropic: waiting for user to paste code
+    AnthropicWaitingCode {
+        verifier: String,
+    },
+    // GitHub: polling for device code completion
+    GitHubPolling {
+        domain: String,
+        device_code: String,
+        interval: u64,
+        expires_in: u64,
+    },
+    // OpenAI: waiting for callback or manual paste
+    OpenAIWaitingCallback {
+        verifier: String,
+        state: String,
+        server: Option<OAuthCallbackServer>,
+    },
+    // Completed (will be handled outside modal)
+    Completed,
+    // Failed
+    Failed(String),
 }
 
 fn render_interactive_ui(
@@ -100,6 +326,91 @@ fn render_interactive_ui(
             write!(stdout, "{truncated}\r\n").map_err(|err| err.to_string())?;
         }
     }
+    stdout.flush().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// Convert crossterm KeyEvent to a key data string for matches_key
+fn key_event_to_data(key: &KeyEvent) -> String {
+    let mut modifiers = String::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        modifiers.push_str("ctrl+");
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        modifiers.push_str("shift+");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        modifiers.push_str("alt+");
+    }
+
+    let key_str = match key.code {
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "escape".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Char(ch) => ch.to_string(),
+        _ => String::new(),
+    };
+
+    if modifiers.is_empty() {
+        key_str
+    } else {
+        format!("{}{}", modifiers, key_str)
+    }
+}
+
+fn render_modal_ui(modal: &ModalState, stdout: &mut impl Write) -> Result<(), String> {
+    let (width, height) = terminal::size().map_err(|err| err.to_string())?;
+    let width = width.max(1) as usize;
+    let height = height.max(1) as usize;
+
+    let modal_lines = match modal {
+        ModalState::None => return Ok(()),
+        ModalState::TreeSelector(state) => state.selector.render(width),
+        ModalState::SessionSelector(state) => state.selector.render(width),
+        ModalState::BranchSelector(state) => state.render(width),
+        ModalState::ModelSelector(state) => state.selector.render(width),
+        ModalState::SettingsSelector(state) => state.selector.render(width),
+        ModalState::OAuthSelector(state) => state.selector.render(width),
+        ModalState::LoginDialog(state) => state.dialog.render(width),
+    };
+
+    // Truncate modal to fit screen
+    let visible_lines: Vec<&str> = modal_lines
+        .iter()
+        .take(height)
+        .map(|s| s.as_str())
+        .collect();
+
+    stdout
+        .execute(MoveTo(0, 0))
+        .map_err(|err| err.to_string())?;
+    stdout
+        .execute(Clear(ClearType::All))
+        .map_err(|err| err.to_string())?;
+
+    for (index, line) in visible_lines.iter().enumerate() {
+        let truncated = truncate_to_width(line, width);
+        if index + 1 == visible_lines.len() {
+            write!(stdout, "{truncated}").map_err(|err| err.to_string())?;
+        } else {
+            write!(stdout, "{truncated}\r\n").map_err(|err| err.to_string())?;
+        }
+    }
+
+    // Fill remaining lines
+    for i in visible_lines.len()..height {
+        if i + 1 == height {
+            write!(stdout, "").map_err(|err| err.to_string())?;
+        } else {
+            write!(stdout, "\r\n").map_err(|err| err.to_string())?;
+        }
+    }
+
     stdout.flush().map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -268,92 +579,177 @@ fn sort_models_for_display(
     choices
 }
 
-fn format_model_overview(
-    models: &[crate::coding_agent::Model],
-    current: &crate::agent::Model,
-) -> String {
-    if models.is_empty() {
-        return "No models available. Set an API key in auth.json or env.".to_string();
-    }
-
-    let choices = sort_models_for_display(models, current);
-
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "Current model: {}/{}",
-        current.provider, current.id
-    ));
-    lines.push("Available models:".to_string());
-    for (idx, model) in choices.iter().enumerate() {
-        let current_marker = model.provider == current.provider && model.id == current.id;
-        let label = if model.name.is_empty() || model.name == model.id {
-            format!("{}/{}", model.provider, model.id)
-        } else {
-            format!("{}/{} ({})", model.provider, model.id, model.name)
-        };
-        let marker = if current_marker { "*" } else { " " };
-        lines.push(format!("{marker} {:>2}) {label}", idx + 1));
-    }
-    lines.push("Use /model <pattern> or /model <number> to select.".to_string());
-    lines.push("Patterns accept provider/model and optional :thinking suffix.".to_string());
-    lines.join("\n")
-}
-
-fn format_settings_overview(session: &AgentSession) -> String {
-    let theme = session
-        .settings_manager
-        .get_theme()
-        .unwrap_or_else(|| "dark".to_string());
-    let thinking_level = session.agent.state().thinking_level.as_str();
-    let available = available_themes().join(", ");
-
-    let mut lines = Vec::new();
-    lines.push("Current settings:".to_string());
-    lines.push(format!(
-        "autocompact: {}",
-        session.settings_manager.get_compaction_enabled()
-    ));
-    lines.push(format!(
-        "show-images: {}",
-        session.settings_manager.get_show_images()
-    ));
-    lines.push(format!(
-        "auto-resize-images: {}",
-        session.settings_manager.get_image_auto_resize()
-    ));
-    lines.push(format!(
-        "steering-mode: {}",
-        session.settings_manager.get_steering_mode()
-    ));
-    lines.push(format!(
-        "follow-up-mode: {}",
-        session.settings_manager.get_follow_up_mode()
-    ));
-    lines.push(format!("thinking-level: {thinking_level}"));
-    lines.push(format!("theme: {theme}"));
-    lines.push(format!(
-        "hide-thinking: {}",
-        session.settings_manager.get_hide_thinking_block()
-    ));
-    lines.push(format!(
-        "collapse-changelog: {}",
-        session.settings_manager.get_collapse_changelog()
-    ));
-    lines.push(format!(
-        "double-escape-action: {}",
-        session.settings_manager.get_double_escape_action()
-    ));
-    lines.push(format!("Available themes: {available}"));
-    lines.push("Usage: /settings <key> <value>".to_string());
-    lines.push(
-        "Keys: autocompact, show-images, auto-resize-images, steering-mode, follow-up-mode, thinking-level, theme, hide-thinking, collapse-changelog, double-escape-action"
-            .to_string(),
-    );
-    lines.join("\n")
-}
-
 fn append_status_entry(entries: &mut Vec<String>, message: &str) {
     entries.push(format!("Status:\n{message}"));
+}
+
+fn apply_setting_change(
+    session: &mut AgentSession,
+    setting_id: &str,
+    value: &str,
+    editor: &mut Editor,
+    rebuild: &mut bool,
+) {
+    match setting_id {
+        "autocompact" => {
+            if let Some(enabled) = parse_bool(value) {
+                session.settings_manager.set_compaction_enabled(enabled);
+            }
+        }
+        "show-images" => {
+            if let Some(enabled) = parse_bool(value) {
+                session.settings_manager.set_show_images(enabled);
+                *rebuild = true;
+            }
+        }
+        "auto-resize-images" => {
+            if let Some(enabled) = parse_bool(value) {
+                session.settings_manager.set_image_auto_resize(enabled);
+            }
+        }
+        "steering-mode" => {
+            if let Some(mode) = parse_queue_mode(value) {
+                session.set_steering_mode(mode);
+                session.settings_manager.set_steering_mode(value);
+            }
+        }
+        "follow-up-mode" => {
+            if let Some(mode) = parse_queue_mode(value) {
+                session.set_follow_up_mode(mode);
+                session.settings_manager.set_follow_up_mode(value);
+            }
+        }
+        "thinking-level" => {
+            if let Some(level) = parse_thinking_level_value(value) {
+                session.set_thinking_level(level);
+            }
+        }
+        "theme" => {
+            let themes = available_themes();
+            if themes.iter().any(|theme| theme == value) {
+                session.settings_manager.set_theme(value);
+                let theme = load_theme_or_default(Some(value));
+                set_active_theme(theme.clone());
+                editor.set_theme(theme.editor_theme());
+            }
+        }
+        "hide-thinking" => {
+            if let Some(enabled) = parse_bool(value) {
+                session.settings_manager.set_hide_thinking_block(enabled);
+                *rebuild = true;
+            }
+        }
+        "collapse-changelog" => {
+            if let Some(enabled) = parse_bool(value) {
+                session.settings_manager.set_collapse_changelog(enabled);
+            }
+        }
+        "double-escape-action" => {
+            if matches!(value, "tree" | "branch") {
+                session.settings_manager.set_double_escape_action(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_settings_items(session: &AgentSession) -> Vec<SettingItem> {
+    let theme_values: Vec<SettingValue> = available_themes()
+        .into_iter()
+        .map(|name| SettingValue {
+            value: name.clone(),
+            label: name.clone(),
+            description: None,
+        })
+        .collect();
+
+    vec![
+        SettingItem {
+            id: "autocompact".to_string(),
+            label: "Auto-compact".to_string(),
+            description: "Automatically compact context when it gets too large".to_string(),
+            current_value: session
+                .settings_manager
+                .get_compaction_enabled()
+                .to_string(),
+            values: bool_values(),
+        },
+        SettingItem {
+            id: "show-images".to_string(),
+            label: "Show images".to_string(),
+            description: "Display inline images in terminal (if supported)".to_string(),
+            current_value: session.settings_manager.get_show_images().to_string(),
+            values: bool_values(),
+        },
+        SettingItem {
+            id: "auto-resize-images".to_string(),
+            label: "Auto-resize images".to_string(),
+            description: "Automatically resize large images".to_string(),
+            current_value: session.settings_manager.get_image_auto_resize().to_string(),
+            values: bool_values(),
+        },
+        SettingItem {
+            id: "steering-mode".to_string(),
+            label: "Steering mode".to_string(),
+            description: "How to handle multiple steering messages".to_string(),
+            current_value: session.settings_manager.get_steering_mode().to_string(),
+            values: queue_mode_values(),
+        },
+        SettingItem {
+            id: "follow-up-mode".to_string(),
+            label: "Follow-up mode".to_string(),
+            description: "How to handle follow-up messages".to_string(),
+            current_value: session.settings_manager.get_follow_up_mode().to_string(),
+            values: queue_mode_values(),
+        },
+        SettingItem {
+            id: "thinking-level".to_string(),
+            label: "Thinking level".to_string(),
+            description: "Amount of reasoning to use".to_string(),
+            current_value: session.agent.state().thinking_level.as_str().to_string(),
+            values: thinking_level_values(),
+        },
+        SettingItem {
+            id: "theme".to_string(),
+            label: "Theme".to_string(),
+            description: "Color theme for the interface".to_string(),
+            current_value: session
+                .settings_manager
+                .get_theme()
+                .unwrap_or_else(|| "dark".to_string()),
+            values: theme_values,
+        },
+        SettingItem {
+            id: "hide-thinking".to_string(),
+            label: "Hide thinking".to_string(),
+            description: "Hide thinking blocks in chat".to_string(),
+            current_value: session
+                .settings_manager
+                .get_hide_thinking_block()
+                .to_string(),
+            values: bool_values(),
+        },
+        SettingItem {
+            id: "collapse-changelog".to_string(),
+            label: "Collapse changelog".to_string(),
+            description: "Collapse changelog entries by default".to_string(),
+            current_value: session
+                .settings_manager
+                .get_collapse_changelog()
+                .to_string(),
+            values: bool_values(),
+        },
+        SettingItem {
+            id: "double-escape-action".to_string(),
+            label: "Double-escape action".to_string(),
+            description: "Action to perform on double Escape key".to_string(),
+            current_value: session
+                .settings_manager
+                .get_double_escape_action()
+                .to_string(),
+            values: double_escape_action_values(),
+        },
+    ]
 }
 
 fn ensure_gh_available() -> Result<(), String> {
@@ -539,6 +935,7 @@ fn handle_key_event(key: KeyEvent, editor: &mut Editor) -> EditorAction {
 
 fn get_slash_commands() -> Vec<SlashCommand> {
     vec![
+        SlashCommand::new("branch", Some("Create branch from message".to_string())),
         SlashCommand::new("changelog", Some("Show version changelog".to_string())),
         SlashCommand::new("clear", Some("Clear the screen".to_string())),
         SlashCommand::new("compact", Some("Compact the session".to_string())),
@@ -547,14 +944,18 @@ fn get_slash_commands() -> Vec<SlashCommand> {
         SlashCommand::new("export", Some("Export session as HTML".to_string())),
         SlashCommand::new("help", Some("Show available commands".to_string())),
         SlashCommand::new("hotkeys", Some("Show keyboard shortcuts".to_string())),
+        SlashCommand::new("login", Some("Login to OAuth provider".to_string())),
+        SlashCommand::new("logout", Some("Logout from OAuth provider".to_string())),
         SlashCommand::new("model", Some("Select AI model".to_string())),
         SlashCommand::new("new", Some("Start new session".to_string())),
         SlashCommand::new("quit", Some("Exit the session".to_string())),
         SlashCommand::new("reset", Some("Reset session".to_string())),
+        SlashCommand::new("resume", Some("Resume different session".to_string())),
         SlashCommand::new("session", Some("Show session info".to_string())),
         SlashCommand::new("settings", Some("Configure settings".to_string())),
         SlashCommand::new("share", Some("Share session as GitHub Gist".to_string())),
         SlashCommand::new("theme", Some("Change theme".to_string())),
+        SlashCommand::new("tree", Some("Navigate session tree".to_string())),
     ]
 }
 
@@ -569,9 +970,24 @@ pub fn run_interactive_mode_session(
     set_active_theme(theme.clone());
     let mut editor = Editor::new(theme.editor_theme());
 
-    // Set up autocomplete with slash commands
+    // Set up autocomplete with slash commands + prompt templates + extension commands
     let cwd = std::env::current_dir().unwrap_or_default();
-    let autocomplete_provider = CombinedAutocompleteProvider::new(get_slash_commands(), cwd);
+    let mut all_commands = get_slash_commands();
+
+    // Add prompt templates as slash commands for autocomplete
+    for template in session.prompt_templates() {
+        all_commands.push(SlashCommand::new(
+            template.name.clone(),
+            Some(template.description.clone()),
+        ));
+    }
+
+    // Add extension commands for autocomplete
+    for cmd in session.extension_commands() {
+        all_commands.push(SlashCommand::new(cmd.name.clone(), cmd.description.clone()));
+    }
+
+    let autocomplete_provider = CombinedAutocompleteProvider::new(all_commands, cwd);
     editor.set_autocomplete_provider(autocomplete_provider);
 
     let mut stdout = io::stdout();
@@ -599,7 +1015,364 @@ pub fn run_interactive_mode_session(
 
     render_interactive_ui(&entries, &mut editor, &mut stdout)?;
 
+    let mut modal_state = ModalState::None;
+
     loop {
+        // Handle modal state rendering and input
+        if !matches!(modal_state, ModalState::None) {
+            render_modal_ui(&modal_state, &mut stdout)?;
+
+            match event::read().map_err(|err| err.to_string())? {
+                Event::Key(key) => {
+                    // Check for Ctrl+C to exit regardless of modal state
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
+
+                    let key_data = key_event_to_data(&key);
+                    match &mut modal_state {
+                        ModalState::TreeSelector(state) => {
+                            // Handle tree selector input
+                            if matches_key(&key_data, "escape") {
+                                state.result = Some(TreeSelectorResult::Cancelled);
+                            } else if matches_key(&key_data, "enter") {
+                                if let Some(id) = state.selector.selected_entry_id() {
+                                    state.result =
+                                        Some(TreeSelectorResult::Selected(id.to_string()));
+                                }
+                            } else {
+                                state.selector.handle_input(&key_data);
+                            }
+                        }
+                        ModalState::SessionSelector(state) => {
+                            // Handle session selector input
+                            if matches_key(&key_data, "escape") {
+                                state.result = Some(SessionSelectorResult::Cancelled);
+                            } else if matches_key(&key_data, "enter") {
+                                if let Some(path) = state.selector.get_selected() {
+                                    state.result = Some(SessionSelectorResult::Selected(path));
+                                }
+                            } else {
+                                state.selector.handle_input(&key_data);
+                            }
+                        }
+                        ModalState::BranchSelector(state) => {
+                            state.handle_input(&key_data);
+                        }
+                        ModalState::ModelSelector(state) => {
+                            // Model selector handles its own input and returns result
+                            if let Some(result) = state.selector.handle_input(&key_data) {
+                                match result {
+                                    ModelSelectorResult::Selected { provider, model_id } => {
+                                        modal_state = ModalState::None;
+                                        if let Some(model) = session
+                                            .get_available_models()
+                                            .iter()
+                                            .find(|m| m.provider == provider && m.id == model_id)
+                                        {
+                                            session.set_model(to_agent_model(model));
+                                            session
+                                                .settings_manager
+                                                .set_default_model_and_provider(
+                                                    &provider, &model_id,
+                                                );
+                                            append_status_entry(
+                                                &mut entries,
+                                                &format!("Model set to {}/{}", provider, model_id),
+                                            );
+                                        }
+                                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                                        continue;
+                                    }
+                                    ModelSelectorResult::Cancelled => {
+                                        modal_state = ModalState::None;
+                                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        ModalState::SettingsSelector(state) => {
+                            // Settings selector handles its own input and returns result
+                            if let Some(result) = state.selector.handle_input(&key_data) {
+                                match result {
+                                    SettingsSelectorResult::Changed { setting_id, value } => {
+                                        let mut rebuild = false;
+                                        apply_setting_change(
+                                            session,
+                                            &setting_id,
+                                            &value,
+                                            &mut editor,
+                                            &mut rebuild,
+                                        );
+                                        if rebuild {
+                                            entries = rebuild_interactive_entries(session, true);
+                                        }
+                                        append_status_entry(
+                                            &mut entries,
+                                            &format!("Updated {} to {}", setting_id, value),
+                                        );
+                                        // Stay in settings modal for more changes
+                                        // User can press Esc to exit
+                                    }
+                                    SettingsSelectorResult::Cancelled => {
+                                        modal_state = ModalState::None;
+                                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        ModalState::OAuthSelector(state) => {
+                            if let Some(result) = state.selector.handle_input(&key_data) {
+                                match result {
+                                    OAuthSelectorResult::Selected(provider_id) => {
+                                        // Start the login/logout flow for this provider
+                                        let mode = state.mode;
+                                        modal_state = ModalState::None;
+
+                                        if mode == OAuthSelectorMode::Logout {
+                                            // Logout: remove credentials
+                                            session.model_registry.remove_credential(&provider_id);
+                                            session.model_registry.refresh();
+                                            append_status_entry(
+                                                &mut entries,
+                                                &format!("Logged out of {}", provider_id),
+                                            );
+                                            render_interactive_ui(
+                                                &entries,
+                                                &mut editor,
+                                                &mut stdout,
+                                            )?;
+                                            continue;
+                                        }
+
+                                        // Login: start the OAuth flow
+                                        let provider_name = get_oauth_providers()
+                                            .iter()
+                                            .find(|p| p.id == provider_id)
+                                            .map(|p| p.name.clone())
+                                            .unwrap_or_else(|| provider_id.clone());
+
+                                        let (dialog, oauth_state) =
+                                            start_oauth_login(&provider_id, &provider_name);
+
+                                        modal_state =
+                                            ModalState::LoginDialog(LoginDialogSelectorState {
+                                                dialog,
+                                                provider_id,
+                                                oauth_state,
+                                            });
+                                        continue;
+                                    }
+                                    OAuthSelectorResult::Cancelled => {
+                                        modal_state = ModalState::None;
+                                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        ModalState::LoginDialog(state) => {
+                            if let Some(result) = state.dialog.handle_input(&key_data) {
+                                match result {
+                                    LoginDialogResult::InputSubmitted(input) => {
+                                        // Process the input based on OAuth flow state
+                                        let provider_id = state.provider_id.clone();
+                                        match &state.oauth_state {
+                                            OAuthFlowState::AnthropicWaitingCode { verifier } => {
+                                                match anthropic_exchange_code(&input, verifier) {
+                                                    Ok(creds) => {
+                                                        session.model_registry.set_credential(
+                                                            &provider_id,
+                                                            creds.to_auth_credential(),
+                                                        );
+                                                        session.model_registry.refresh();
+                                                        modal_state = ModalState::None;
+                                                        append_status_entry(
+                                                            &mut entries,
+                                                            &format!(
+                                                                "Logged in to {}. Credentials saved.",
+                                                                provider_id
+                                                            ),
+                                                        );
+                                                        render_interactive_ui(
+                                                            &entries,
+                                                            &mut editor,
+                                                            &mut stdout,
+                                                        )?;
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        state.dialog.fail(&e);
+                                                    }
+                                                }
+                                            }
+                                            OAuthFlowState::OpenAIWaitingCallback {
+                                                verifier,
+                                                state: oauth_state_str,
+                                                ..
+                                            } => {
+                                                match openai_codex_login_with_input(
+                                                    &input,
+                                                    verifier,
+                                                    oauth_state_str,
+                                                ) {
+                                                    Ok(creds) => {
+                                                        session.model_registry.set_credential(
+                                                            &provider_id,
+                                                            creds.to_auth_credential(),
+                                                        );
+                                                        session.model_registry.refresh();
+                                                        modal_state = ModalState::None;
+                                                        append_status_entry(
+                                                            &mut entries,
+                                                            &format!(
+                                                                "Logged in to {}. Credentials saved.",
+                                                                provider_id
+                                                            ),
+                                                        );
+                                                        render_interactive_ui(
+                                                            &entries,
+                                                            &mut editor,
+                                                            &mut stdout,
+                                                        )?;
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        state.dialog.fail(&e);
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    LoginDialogResult::Cancelled => {
+                                        modal_state = ModalState::None;
+                                        render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        ModalState::None => {}
+                    }
+
+                    // Check and process modal completion
+                    // Tree selector result
+                    if let ModalState::TreeSelector(state) = &mut modal_state {
+                        if let Some(result) = state.result.take() {
+                            match result {
+                                TreeSelectorResult::Selected(entry_id) => {
+                                    modal_state = ModalState::None;
+                                    match session.navigate_tree(
+                                        &entry_id,
+                                        crate::coding_agent::NavigateTreeOptions::default(),
+                                    ) {
+                                        Ok(_result) => {
+                                            entries = rebuild_interactive_entries(session, true);
+                                            append_status_entry(
+                                                &mut entries,
+                                                "Navigated to selected entry.",
+                                            );
+                                        }
+                                        Err(err) => {
+                                            append_status_entry(
+                                                &mut entries,
+                                                &format!("Navigation failed: {err}"),
+                                            );
+                                        }
+                                    }
+                                }
+                                TreeSelectorResult::Cancelled => {
+                                    modal_state = ModalState::None;
+                                }
+                            }
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
+                    }
+
+                    // Session selector result
+                    if let ModalState::SessionSelector(state) = &mut modal_state {
+                        if let Some(result) = state.result.take() {
+                            match result {
+                                SessionSelectorResult::Selected(path) => {
+                                    modal_state = ModalState::None;
+                                    match session.switch_session(path) {
+                                        Ok(_) => {
+                                            entries = rebuild_interactive_entries(session, true);
+                                            append_status_entry(
+                                                &mut entries,
+                                                &format!(
+                                                    "Resumed session: {}",
+                                                    session.session_id()
+                                                ),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            append_status_entry(
+                                                &mut entries,
+                                                &format!("Failed to resume session: {err}"),
+                                            );
+                                        }
+                                    }
+                                }
+                                SessionSelectorResult::Cancelled => {
+                                    modal_state = ModalState::None;
+                                }
+                            }
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
+                    }
+
+                    // Branch selector result
+                    if let ModalState::BranchSelector(state) = &mut modal_state {
+                        if let Some(result) = state.result.take() {
+                            match result {
+                                BranchSelectorResult::Selected(entry_id) => {
+                                    modal_state = ModalState::None;
+                                    match session.branch(&entry_id) {
+                                        Ok(result) => {
+                                            entries = rebuild_interactive_entries(session, true);
+                                            let msg = if result.selected_text.is_empty() {
+                                                "Created new branch.".to_string()
+                                            } else {
+                                                format!(
+                                                    "Created branch from: {}",
+                                                    truncate_to_width(&result.selected_text, 50)
+                                                )
+                                            };
+                                            append_status_entry(&mut entries, &msg);
+                                        }
+                                        Err(err) => {
+                                            append_status_entry(
+                                                &mut entries,
+                                                &format!("Failed to create branch: {err}"),
+                                            );
+                                        }
+                                    }
+                                }
+                                BranchSelectorResult::Cancelled => {
+                                    modal_state = ModalState::None;
+                                }
+                            }
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
+                    }
+                }
+                Event::Resize(_, _) => {
+                    render_modal_ui(&modal_state, &mut stdout)?;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match event::read().map_err(|err| err.to_string())? {
             Event::Key(key) => match handle_key_event(key, &mut editor) {
                 EditorAction::Exit => break,
@@ -723,11 +1496,30 @@ pub fn run_interactive_mode_session(
                         let available = session.get_available_models();
                         let current_model = session.agent.state().model;
                         if rest.is_empty() {
-                            append_status_entry(
-                                &mut entries,
-                                &format_model_overview(&available, &current_model),
-                            );
-                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            // Open model selector UI
+                            if available.is_empty() {
+                                append_status_entry(
+                                    &mut entries,
+                                    "No models available. Set an API key in auth.json or env.",
+                                );
+                                render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                                continue;
+                            }
+                            let (_, height) = terminal::size().unwrap_or((80, 24));
+                            let max_visible = ((height as usize).saturating_sub(10)).clamp(5, 15);
+                            let model_items: Vec<ModelItem> = available
+                                .iter()
+                                .map(|m| {
+                                    ModelItem::from_model(
+                                        m,
+                                        &current_model.provider,
+                                        &current_model.id,
+                                    )
+                                })
+                                .collect();
+                            let selector = ModelSelectorComponent::new(model_items, max_visible);
+                            modal_state =
+                                ModalState::ModelSelector(ModelSelectorState { selector });
                             continue;
                         }
                         if available.is_empty() {
@@ -785,8 +1577,14 @@ pub fn run_interactive_mode_session(
                     if trimmed.starts_with("/settings") {
                         let rest = trimmed.trim_start_matches("/settings").trim();
                         if rest.is_empty() {
-                            append_status_entry(&mut entries, &format_settings_overview(session));
-                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            // Open settings selector UI
+                            let (_, height) = terminal::size().unwrap_or((80, 24));
+                            let max_visible = ((height as usize).saturating_sub(10)).clamp(5, 15);
+                            let settings_items = build_settings_items(session);
+                            let selector =
+                                SettingsSelectorComponent::new(settings_items, max_visible);
+                            modal_state =
+                                ModalState::SettingsSelector(SettingsSelectorState { selector });
                             continue;
                         }
                         let mut parts = rest.split_whitespace();
@@ -951,19 +1749,25 @@ pub fn run_interactive_mode_session(
                     if trimmed == "/help" {
                         let help_text = [
                             "Available commands:",
+                            "  /branch       - Create branch from message",
+                            "  /changelog    - Show version changelog",
                             "  /clear        - Clear the screen",
                             "  /compact      - Compact the session",
                             "  /copy         - Copy last assistant message to clipboard",
                             "  /export       - Export session as HTML",
                             "  /help         - Show this help",
                             "  /hotkeys      - Show keyboard shortcuts",
+                            "  /login        - Login to OAuth provider",
+                            "  /logout       - Logout from OAuth provider",
                             "  /model        - Select AI model",
+                            "  /new          - Start new session",
                             "  /reset        - Reset/clear the session",
+                            "  /resume       - Resume different session",
                             "  /session      - Show session information",
                             "  /settings     - Configure settings",
                             "  /share        - Share session as GitHub Gist",
                             "  /theme <name> - Change theme",
-                            "  /changelog    - Show version changelog",
+                            "  /tree         - Navigate session tree",
                             "  /exit, /quit  - Exit the session",
                             "",
                             "Type / to see autocomplete suggestions.",
@@ -1068,6 +1872,91 @@ pub fn run_interactive_mode_session(
                         render_interactive_ui(&entries, &mut editor, &mut stdout)?;
                         continue;
                     }
+                    if trimmed == "/tree" {
+                        let tree = session.session_manager.get_tree();
+                        if tree.is_empty() {
+                            append_status_entry(&mut entries, "Session tree is empty.");
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
+                        let (_, height) = terminal::size().unwrap_or((80, 24));
+                        let leaf_id = session.session_manager.get_leaf_id();
+                        let selector = TreeSelectorComponent::new(tree, leaf_id, height as usize);
+                        modal_state = ModalState::TreeSelector(TreeSelectorState {
+                            selector,
+                            result: None,
+                        });
+                        continue;
+                    }
+                    if trimmed == "/branch" {
+                        let candidates = session.get_user_messages_for_branching();
+                        if candidates.is_empty() {
+                            append_status_entry(&mut entries, "No user messages to branch from.");
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
+                        modal_state =
+                            ModalState::BranchSelector(BranchSelectorState::new(candidates));
+                        continue;
+                    }
+                    if trimmed == "/resume" {
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let session_dir = Some(session.session_manager.get_session_dir());
+                        let sessions = SessionManager::list(&cwd, session_dir);
+                        if sessions.is_empty() {
+                            append_status_entry(&mut entries, "No sessions found.");
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
+                        let (_, height) = terminal::size().unwrap_or((80, 24));
+                        let max_visible = (height as usize / 3).max(3);
+                        let selector = SessionSelectorComponent::new(sessions, max_visible);
+                        modal_state = ModalState::SessionSelector(SessionSelectorState {
+                            selector,
+                            result: None,
+                        });
+                        continue;
+                    }
+                    if trimmed == "/login" || trimmed.starts_with("/login ") {
+                        // Show OAuth provider selector for login
+                        let selector = OAuthSelectorComponent::new(
+                            OAuthSelectorMode::Login,
+                            &session.model_registry,
+                        );
+                        modal_state = ModalState::OAuthSelector(OAuthSelectorState {
+                            selector,
+                            mode: OAuthSelectorMode::Login,
+                        });
+                        continue;
+                    }
+                    if trimmed == "/logout" || trimmed.starts_with("/logout ") {
+                        // Check if any providers are logged in
+                        let has_logged_in = get_oauth_providers().iter().any(|p| {
+                            matches!(
+                                session.model_registry.get_credential(&p.id),
+                                Some(AuthCredential::OAuth { .. })
+                            )
+                        });
+                        if !has_logged_in {
+                            append_status_entry(
+                                &mut entries,
+                                "No OAuth providers logged in. Use /login first.",
+                            );
+                            render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                            continue;
+                        }
+
+                        // Show OAuth provider selector for logout
+                        let selector = OAuthSelectorComponent::new(
+                            OAuthSelectorMode::Logout,
+                            &session.model_registry,
+                        );
+                        modal_state = ModalState::OAuthSelector(OAuthSelectorState {
+                            selector,
+                            mode: OAuthSelectorMode::Logout,
+                        });
+                        continue;
+                    }
                     editor.add_to_history(&prompt);
                     prompt_and_append_text(
                         session,
@@ -1097,6 +1986,77 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Start OAuth login flow for a provider
+fn start_oauth_login(
+    provider_id: &str,
+    provider_name: &str,
+) -> (LoginDialogComponent, OAuthFlowState) {
+    let mut dialog = LoginDialogComponent::new(provider_name);
+
+    match provider_id {
+        "anthropic" => {
+            let (url, verifier) = anthropic_get_auth_url();
+            dialog.show_auth(
+                &url,
+                Some("Complete authorization and paste the code (code#state):"),
+            );
+            open_browser(&url);
+            dialog.show_prompt("Paste authorization code:", Some("abc123#xyz789"));
+            (dialog, OAuthFlowState::AnthropicWaitingCode { verifier })
+        }
+        "github-copilot" => {
+            // GitHub uses device code flow - we'd need to poll in background
+            // For now, show instructions
+            dialog.show_progress("GitHub Copilot login requires browser authentication.");
+            dialog.show_auth(
+                "https://github.com/login/device",
+                Some("Device code flow not yet implemented in TUI. Use manual auth.json configuration."),
+            );
+            (
+                dialog,
+                OAuthFlowState::Failed(
+                    "GitHub Copilot device flow not implemented in TUI".to_string(),
+                ),
+            )
+        }
+        "openai-codex" => {
+            let (url, verifier, state) = openai_codex_get_auth_url();
+            let server = OAuthCallbackServer::start(&state);
+            let has_server = server.is_available();
+
+            dialog.show_auth(
+                &url,
+                if has_server {
+                    Some("A browser window should open. Complete login to finish.")
+                } else {
+                    Some("Complete login and paste the redirect URL:")
+                },
+            );
+            open_browser(&url);
+
+            if !has_server {
+                dialog.show_prompt("Paste redirect URL or code:", None);
+            }
+
+            (
+                dialog,
+                OAuthFlowState::OpenAIWaitingCallback {
+                    verifier,
+                    state,
+                    server: Some(server),
+                },
+            )
+        }
+        _ => {
+            dialog.fail(&format!("Unknown provider: {}", provider_id));
+            (
+                dialog,
+                OAuthFlowState::Failed(format!("Unknown provider: {}", provider_id)),
+            )
+        }
+    }
 }
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {

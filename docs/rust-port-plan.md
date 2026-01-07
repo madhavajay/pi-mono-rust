@@ -252,18 +252,48 @@ Planned modules (initial, not final):
   - Double `!!` runs command without adding to context.
   - Displays command, stdout, exit code (if non-zero), and cancelled status.
   - Added to editor history for command recall.
+- **Prompt template suggestions in autocomplete**:
+  - Prompt templates from `~/.pi/agent/prompts` and `.pi/prompts` are now included in slash command autocomplete.
+  - Shows template name and description (from frontmatter or first line).
+  - Full parity with TS which adds `promptTemplates` to autocomplete.
+- **Extension command suggestions in autocomplete**:
+  - Extension commands are now included in slash command autocomplete.
+  - `AgentSession` stores extension commands via `set_extension_commands()` / `extension_commands()`.
+  - Commands include name and description from extension manifest.
+- **Interactive UI selectors for /model and /settings**:
+  - `ModelSelectorComponent`: Full UI picker for model selection with search filtering.
+    - Displays models sorted by current first, then provider/id.
+    - Shows reasoning indicator (⚡) and current model checkmark (✓).
+    - Keyboard navigation (up/down, wrapping) with scroll indicators.
+    - Fuzzy search filtering on model id and provider name.
+  - `SettingsSelectorComponent`: Full UI picker for settings with value selection.
+    - Two-level UI: settings list → value list for each setting.
+    - Shows current value with checkmark indicator.
+    - All settings supported: autocompact, show-images, auto-resize-images, steering-mode, follow-up-mode, thinking-level, theme, hide-thinking, collapse-changelog, double-escape-action.
+    - Descriptions shown for selected items.
+  - `/model` command now opens model picker UI when called with no arguments.
+  - `/settings` command now opens settings picker UI when called with no arguments.
+  - Both commands still support direct arguments (`/model claude-opus-4`, `/settings theme dark`).
+- **OAuth login/logout flow**:
+  - `coding_agent/oauth.rs`: Full OAuth implementation for Anthropic, OpenAI Codex, and GitHub Copilot.
+  - PKCE code challenge generation (SHA-256 + Base64URL encoding).
+  - Anthropic OAuth: Authorization URL generation, token exchange, refresh token support.
+  - OpenAI Codex OAuth: Authorization URL with local callback server on port 1455, token exchange, JWT account ID extraction.
+  - GitHub Copilot OAuth: Device code flow structure (polling not yet wired in TUI).
+  - `OAuthSelectorComponent`: TUI picker for selecting OAuth provider to login/logout.
+  - `LoginDialogComponent`: TUI dialog for OAuth flow with URL display, code input, progress/error states.
+  - `/login` command: Opens OAuth provider selector, initiates browser-based OAuth flow.
+  - `/logout` command: Opens OAuth provider selector (showing logged-in providers), removes credentials.
+  - Credentials stored via `ModelRegistry::set_credential()` / `remove_credential()`.
+  - Browser auto-open via platform-specific commands (xdg-open/open/start).
 
 ## Remaining Gaps (Accurate as of 2026-01-07)
 
-### Interactive TUI - Missing Features:
-1. **Missing slash commands**: `/branch`, `/tree`, `/login`, `/logout`, `/resume` (need UI selectors)
-2. **Interactive UI selectors** - `/model` and `/settings` are text-only, no picker UI (TreeSelector/SessionSelector exist but not wired)
-3. **Prompt template suggestions** - Not wired to autocomplete
-4. **Extension command suggestions** - Not wired to autocomplete
-5. **Clipboard image paste** - Ctrl+V not supported
+### Interactive TUI - Minor Gaps:
+1. **Clipboard image paste** - Ctrl+V not supported for images
 
 ### TS Extensions:
-- JS extensions work, TS extensions need jiti loader
+- JS extensions work, TS extensions load via jiti when available (with fallback message if jiti not installed)
 
 ## Test Plan
 ### Baseline (TS)
