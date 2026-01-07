@@ -115,7 +115,13 @@ impl AuthStorage {
             return true;
         }
         if let Some(resolver) = &self.fallback_resolver {
-            return resolver(provider).is_some();
+            if resolver(provider).is_some() {
+                return true;
+            }
+        }
+        // Check for google-gemini-cli fallback credentials
+        if provider == "google-gemini-cli" && has_gemini_cli_credentials() {
+            return true;
         }
         false
     }
@@ -132,9 +138,19 @@ impl AuthStorage {
                 if let Some(env_key) = env_api_key(provider) {
                     return Some(env_key);
                 }
-                self.fallback_resolver
+                if let Some(key) = self
+                    .fallback_resolver
                     .as_ref()
                     .and_then(|resolver| resolver(provider))
+                {
+                    return Some(key);
+                }
+                // Return placeholder for google-gemini-cli if ~/.gemini/oauth_creds.json exists
+                // The actual credential resolution happens in resolve_google_gemini_cli_credentials
+                if provider == "google-gemini-cli" && has_gemini_cli_credentials() {
+                    return Some("<gemini-cli>".to_string());
+                }
+                None
             }
         }
     }
@@ -207,6 +223,20 @@ fn has_vertex_adc_credentials() -> bool {
             .join(".config")
             .join("gcloud")
             .join("application_default_credentials.json");
+        path.exists()
+    })
+}
+
+static GEMINI_CLI_CREDS_EXISTS: OnceLock<bool> = OnceLock::new();
+
+/// Check if ~/.gemini/oauth_creds.json exists (used by official gemini CLI)
+fn has_gemini_cli_credentials() -> bool {
+    *GEMINI_CLI_CREDS_EXISTS.get_or_init(|| {
+        let home_dir = env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = home_dir.join(".gemini").join("oauth_creds.json");
         path.exists()
     })
 }

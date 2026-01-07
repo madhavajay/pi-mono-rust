@@ -320,6 +320,8 @@ Planned modules (initial, not final):
   - Event streaming: Python callbacks receive session events as dicts (agent events, compaction events).
   - All classes marked `unsendable` for single-threaded use (matching Rc/RefCell internals).
   - Build: `maturin develop --features python` (in pi-mono-rust directory with a Python venv).
+  - **Gemini CLI auth fallback**: `AuthStorage.has_auth()` and `get_api_key()` now detect `~/.gemini/oauth_creds.json` for `google-gemini-cli` provider.
+  - **Gemini CLI creds parsing fix**: `expiry_date` field parsed as float (official gemini CLI writes floats, not ints).
   - Note: Tools not yet wired in PyO3 (basic chat mode only; tool support TODO).
 
 ## Remaining Gaps (Accurate as of 2026-01-07)

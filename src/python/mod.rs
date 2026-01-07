@@ -785,14 +785,21 @@ fn build_py_stream_fn(
         "openai-codex-responses" => Ok(build_codex_stream_fn(model, api_key)),
         "google-gemini-cli" => {
             // Gemini uses resolve_google_gemini_cli_credentials which expects JSON with token/projectId
+            // If api_key is the placeholder from has_auth(), pass None to use fallback resolution
+            let api_key_opt = if api_key == "<gemini-cli>" {
+                None
+            } else {
+                Some(api_key.as_str())
+            };
             let (access_token, project_id) =
-                crate::cli::auth::resolve_google_gemini_cli_credentials(Some(&api_key))
-                    .map_err(|e| {
+                crate::cli::auth::resolve_google_gemini_cli_credentials(api_key_opt).map_err(
+                    |e| {
                         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                             "Failed to resolve Gemini credentials: {}",
                             e
                         ))
-                    })?;
+                    },
+                )?;
             Ok(build_gemini_stream_fn(model, access_token, project_id))
         }
         api => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
