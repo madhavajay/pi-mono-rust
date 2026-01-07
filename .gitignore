@@ -21,3 +21,12 @@ target
 #.idea/
 
 TASK.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.so
+.venv/
+*.egg-info/
+target/
