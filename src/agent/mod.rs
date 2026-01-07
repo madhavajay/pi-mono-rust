@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ai::AssistantMessageEvent;
@@ -35,6 +36,37 @@ pub type ConvertToLlmFn = dyn FnMut(&[AgentMessage]) -> Vec<AgentMessage>;
 pub type TransformContextFn = dyn FnMut(&[AgentMessage]) -> Vec<AgentMessage>;
 pub type SteeringFn = dyn FnMut() -> Vec<AgentMessage>;
 pub type ListenerFn = dyn Fn(&AgentEvent);
+pub type ApprovalFn = dyn FnMut(&ApprovalRequest) -> ApprovalResponse;
+
+/// Request for tool approval before execution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    /// Unique ID for this tool call
+    pub tool_call_id: String,
+    /// Name of the tool being called
+    pub tool_name: String,
+    /// Arguments passed to the tool
+    pub args: Value,
+    /// Shell command if this is a bash tool call
+    pub command: Option<String>,
+    /// Working directory for command execution
+    pub cwd: Option<String>,
+    /// Reason why approval is needed (e.g., "potentially destructive command")
+    pub reason: Option<String>,
+}
+
+/// Response to an approval request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalResponse {
+    /// Approve this single tool call
+    Approve,
+    /// Approve this tool for the rest of the session
+    ApproveSession,
+    /// Deny this tool call (skip it)
+    Deny,
+    /// Abort the entire agent loop
+    Abort,
+}
 
 #[derive(Clone)]
 pub struct AgentTool {
@@ -102,6 +134,8 @@ pub struct AgentContext {
     pub system_prompt: String,
     pub messages: Vec<AgentMessage>,
     pub tools: Vec<AgentTool>,
+    /// Working directory for tool execution (used in approval requests)
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +166,10 @@ pub struct AgentLoopConfig {
     pub transform_context: Option<Box<TransformContextFn>>,
     pub get_steering_messages: Option<Box<SteeringFn>>,
     pub get_follow_up_messages: Option<Box<SteeringFn>>,
+    /// Optional callback to request approval before tool execution.
+    /// If provided, will be called before each tool call. The callback
+    /// should return an ApprovalResponse indicating whether to proceed.
+    pub on_approval: Option<Box<ApprovalFn>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,6 +209,9 @@ pub enum AgentEvent {
         result: AgentToolResult,
         is_error: bool,
     },
+    /// Emitted when a tool requires approval before execution.
+    /// The agent loop will pause until the approval callback responds.
+    ApprovalRequest(ApprovalRequest),
 }
 
 impl AgentEvent {
@@ -186,6 +227,7 @@ impl AgentEvent {
             AgentEvent::ToolExecutionStart { .. } => "tool_execution_start",
             AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
             AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
+            AgentEvent::ApprovalRequest { .. } => "approval_request",
         }
     }
 }
@@ -322,6 +364,8 @@ fn run_loop<F>(
         .as_mut()
         .map(|f| f())
         .unwrap_or_default();
+    // Track tools that have been approved for the session
+    let mut session_approved_tools = std::collections::HashSet::new();
 
     loop {
         let mut has_more_tool_calls = true;
@@ -371,10 +415,26 @@ fn run_loop<F>(
                     &current_context.tools,
                     &message,
                     &mut config.get_steering_messages,
+                    &mut config.on_approval,
+                    current_context.cwd.as_deref(),
+                    &mut session_approved_tools,
                     stream,
                 );
                 tool_results.extend(tool_execution.tool_results.clone());
                 steering_after_tools = tool_execution.steering_messages;
+
+                // If user aborted, end the loop early
+                if tool_execution.aborted {
+                    stream.push(AgentEvent::TurnEnd {
+                        message: AgentMessage::Assistant(message),
+                        tool_results,
+                    });
+                    stream.push(AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                    });
+                    stream.end(new_messages.clone());
+                    return;
+                }
 
                 for result in tool_execution.tool_results {
                     current_context
@@ -523,20 +583,85 @@ where
 struct ToolExecutionResult {
     tool_results: Vec<ToolResultMessage>,
     steering_messages: Option<Vec<AgentMessage>>,
+    /// True if user aborted via approval callback
+    aborted: bool,
 }
 
 fn execute_tool_calls(
     tools: &[AgentTool],
     assistant_message: &AssistantMessage,
     get_steering_messages: &mut Option<Box<dyn FnMut() -> Vec<AgentMessage>>>,
+    on_approval: &mut Option<Box<ApprovalFn>>,
+    cwd: Option<&str>,
+    session_approved_tools: &mut std::collections::HashSet<String>,
     stream: &mut AgentStream,
 ) -> ToolExecutionResult {
     let tool_calls = extract_tool_calls(assistant_message);
     let mut results = Vec::new();
     let mut steering_messages: Option<Vec<AgentMessage>> = None;
+    #[allow(unused_assignments)]
+    let aborted = false;
 
     for (index, tool_call) in tool_calls.iter().enumerate() {
         let tool = tools.iter().find(|tool| tool.name == tool_call.name);
+
+        // Check if approval is needed
+        if let Some(approval_fn) = on_approval.as_mut() {
+            // Skip approval if tool was already approved for session
+            if !session_approved_tools.contains(&tool_call.name) {
+                // Extract bash command if this is a bash tool
+                let command = if tool_call.name == "bash" {
+                    tool_call
+                        .arguments
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
+                let approval_request = ApprovalRequest {
+                    tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.name.clone(),
+                    args: tool_call.arguments.clone(),
+                    command,
+                    cwd: cwd.map(|s| s.to_string()),
+                    reason: None,
+                };
+
+                // Emit approval request event
+                stream.push(AgentEvent::ApprovalRequest(approval_request.clone()));
+
+                // Call the approval callback and handle response
+                let response = approval_fn(&approval_request);
+                match response {
+                    ApprovalResponse::Approve => {
+                        // Continue with this tool call
+                    }
+                    ApprovalResponse::ApproveSession => {
+                        // Remember this tool is approved for session
+                        session_approved_tools.insert(tool_call.name.clone());
+                    }
+                    ApprovalResponse::Deny => {
+                        // Skip this tool call with a denied message
+                        results.push(deny_tool_call(tool_call, stream));
+                        continue;
+                    }
+                    ApprovalResponse::Abort => {
+                        // Skip remaining tool calls and abort the loop
+                        results.push(deny_tool_call(tool_call, stream));
+                        for skipped in tool_calls.iter().skip(index + 1) {
+                            results.push(deny_tool_call(skipped, stream));
+                        }
+                        return ToolExecutionResult {
+                            tool_results: results,
+                            steering_messages: None,
+                            aborted: true,
+                        };
+                    }
+                }
+            }
+        }
 
         stream.push(AgentEvent::ToolExecutionStart {
             tool_call_id: tool_call.id.clone(),
@@ -610,6 +735,7 @@ fn execute_tool_calls(
     ToolExecutionResult {
         tool_results: results,
         steering_messages,
+        aborted,
     }
 }
 
@@ -617,6 +743,46 @@ fn skip_tool_call(tool_call: &ToolCall, stream: &mut AgentStream) -> ToolResultM
     let result = AgentToolResult {
         content: vec![ContentBlock::Text {
             text: "Skipped due to queued user message.".to_string(),
+            text_signature: None,
+        }],
+        details: Value::Null,
+    };
+
+    stream.push(AgentEvent::ToolExecutionStart {
+        tool_call_id: tool_call.id.clone(),
+        tool_name: tool_call.name.clone(),
+        args: tool_call.arguments.clone(),
+    });
+    stream.push(AgentEvent::ToolExecutionEnd {
+        tool_call_id: tool_call.id.clone(),
+        tool_name: tool_call.name.clone(),
+        result: result.clone(),
+        is_error: true,
+    });
+
+    let tool_result_message = ToolResultMessage {
+        tool_call_id: tool_call.id.clone(),
+        tool_name: tool_call.name.clone(),
+        content: result.content.clone(),
+        details: Some(result.details),
+        is_error: true,
+        timestamp: now_millis(),
+    };
+
+    stream.push(AgentEvent::MessageStart {
+        message: AgentMessage::ToolResult(tool_result_message.clone()),
+    });
+    stream.push(AgentEvent::MessageEnd {
+        message: AgentMessage::ToolResult(tool_result_message.clone()),
+    });
+
+    tool_result_message
+}
+
+fn deny_tool_call(tool_call: &ToolCall, stream: &mut AgentStream) -> ToolResultMessage {
+    let result = AgentToolResult {
+        content: vec![ContentBlock::Text {
+            text: "Tool call denied by user.".to_string(),
             text_signature: None,
         }],
         details: Value::Null,

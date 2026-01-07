@@ -143,7 +143,30 @@ pub fn resolve_openai_codex_credentials(api_key_override: Option<&str>) -> Resul
 struct GeminiCliOAuthCreds {
     access_token: String,
     refresh_token: Option<String>,
+    // expiry_date can be a float or int depending on how the gemini CLI wrote it
+    #[serde(deserialize_with = "deserialize_expiry_date", default)]
     expiry_date: Option<i64>,
+}
+
+fn deserialize_expiry_date<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Number(n)) => {
+            // Try to get as i64 first, otherwise convert from f64
+            if let Some(i) = n.as_i64() {
+                Ok(Some(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(Some(f as i64))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Resolve Google Gemini CLI credentials.

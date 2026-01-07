@@ -7,8 +7,8 @@ use crate::core::messages::{AssistantMessage, ContentBlock, UserContent, UserMes
 
 use super::{
     agent_loop, agent_loop_continue, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage,
-    AgentTool, ConvertToLlmFn, CustomMessage, ListenerFn, LlmContext, Model, StreamEvents,
-    StreamFn, TransformContextFn,
+    AgentTool, ApprovalFn, ApprovalRequest, ApprovalResponse, ConvertToLlmFn, CustomMessage,
+    ListenerFn, LlmContext, Model, StreamEvents, StreamFn, TransformContextFn,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +75,7 @@ pub struct AgentOptions {
     pub follow_up_mode: Option<QueueMode>,
     pub stream_fn: Option<Box<StreamFn>>,
     pub abort_flag: Option<Rc<Cell<bool>>>,
+    pub on_approval: Option<Rc<RefCell<Box<ApprovalFn>>>>,
 }
 
 type ListenerEntry = (usize, Box<ListenerFn>);
@@ -91,6 +92,7 @@ pub struct Agent {
     follow_up_mode: QueueMode,
     stream_fn: Rc<RefCell<Box<StreamFn>>>,
     aborted: Rc<Cell<bool>>,
+    on_approval: Option<Rc<RefCell<Box<ApprovalFn>>>>,
 }
 
 impl Agent {
@@ -103,6 +105,7 @@ impl Agent {
             follow_up_mode,
             stream_fn,
             abort_flag,
+            on_approval,
         } = opts;
         let mut state = AgentState {
             system_prompt: String::new(),
@@ -163,7 +166,13 @@ impl Agent {
             follow_up_mode: follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             stream_fn: Rc::new(RefCell::new(stream_fn)),
             aborted,
+            on_approval,
         }
+    }
+
+    /// Set the approval callback.
+    pub fn set_on_approval(&mut self, callback: Option<Rc<RefCell<Box<ApprovalFn>>>>) {
+        self.on_approval = callback;
     }
 
     pub fn state(&self) -> AgentState {
@@ -289,6 +298,7 @@ impl Agent {
             system_prompt: state_snapshot.system_prompt.clone(),
             messages: state_snapshot.messages.clone(),
             tools: state_snapshot.tools.clone(),
+            cwd: None,
         };
 
         let config = self.build_loop_config();
@@ -340,6 +350,7 @@ impl Agent {
             system_prompt: state_snapshot.system_prompt.clone(),
             messages: state_snapshot.messages.clone(),
             tools: state_snapshot.tools.clone(),
+            cwd: None,
         };
 
         let config = self.build_loop_config();
@@ -379,6 +390,7 @@ impl Agent {
         let steering_mode = self.steering_mode;
         let follow_up_mode = self.follow_up_mode;
         let model = self.state.borrow().model.clone();
+        let on_approval_opt = self.on_approval.clone();
 
         let convert =
             Box::new(move |messages: &[AgentMessage]| (convert_to_llm.borrow_mut())(messages));
@@ -422,12 +434,20 @@ impl Agent {
             }
         });
 
+        // Wrap the Rc<RefCell<Box<ApprovalFn>>> into a Box<ApprovalFn>
+        let on_approval = on_approval_opt.map(|approval_rc| {
+            Box::new(move |request: &ApprovalRequest| -> ApprovalResponse {
+                (approval_rc.borrow_mut())(request)
+            }) as Box<ApprovalFn>
+        });
+
         AgentLoopConfig {
             model,
             convert_to_llm: convert,
             transform_context: transform,
             get_steering_messages: Some(steering),
             get_follow_up_messages: Some(follow_up),
+            on_approval,
         }
     }
 }
