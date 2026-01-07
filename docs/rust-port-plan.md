@@ -293,6 +293,15 @@ Planned modules (initial, not final):
   - Windows: Uses PowerShell to read clipboard image.
   - Image written to temp file with UUID-based name (pi-clipboard-{UUID}.png).
   - File path inserted at cursor position for inclusion in message.
+- **PyO3 Python bindings** (feature-gated under `python` feature):
+  - `src/python/mod.rs`: Python bindings for embedding pi-mono-rust in Python applications.
+  - `PyAuthStorage`: Wrapper for credential storage (get/set/remove/list/reload).
+  - `PyAgentSession`: Wrapper for agent sessions (prompt, subscribe, abort, session management).
+  - OAuth helper functions: `anthropic_get_auth_url`, `anthropic_exchange_code`, `anthropic_refresh_token`.
+  - OAuth helper functions: `openai_codex_get_auth_url`, `openai_codex_exchange_code`, `openai_codex_refresh_token`.
+  - Event streaming: Python callbacks receive session events as dicts (agent events, compaction events).
+  - All classes marked `unsendable` for single-threaded use (matching Rc/RefCell internals).
+  - Build: `cargo build --features python` produces `_pi_mono` Python extension module.
 
 ## Remaining Gaps (Accurate as of 2026-01-07)
 
