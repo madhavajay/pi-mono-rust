@@ -1,3 +1,4 @@
+pub mod google_gemini_cli;
 pub mod openai_codex;
 
 use crate::agent::{AgentMessage, LlmContext, StreamEvents};

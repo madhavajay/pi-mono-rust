@@ -2,10 +2,8 @@
 // Run with: PI_LIVE_TESTS=1 cargo test --test subscription_live_test -- --ignored --nocapture
 
 use pi::agent::{AgentMessage, LlmContext, StreamEvents};
+use pi::api::openai_codex::{stream_openai_codex_responses, CodexStreamOptions, CodexTool};
 use pi::api::{build_anthropic_messages, stream_anthropic, AnthropicCallOptions, AnthropicTool};
-use pi::api::openai_codex::{
-    stream_openai_codex_responses, CodexStreamOptions, CodexTool,
-};
 use pi::coding_agent::{
     anthropic_refresh_token, openai_codex_refresh_token, AuthCredential, AuthStorage, Model,
     ModelRegistry, OAuthCredentials,
@@ -86,10 +84,7 @@ fn refresh_oauth(provider: &str, refresh: &str) -> Result<OAuthCredentials, Stri
     }
 }
 
-fn resolve_provider_auth(
-    storage: &mut AuthStorage,
-    provider: &str,
-) -> Option<ProviderAuth> {
+fn resolve_provider_auth(storage: &mut AuthStorage, provider: &str) -> Option<ProviderAuth> {
     let credential = storage.get(provider).cloned();
     match credential {
         Some(AuthCredential::ApiKey { key }) => Some(ProviderAuth {
@@ -102,7 +97,7 @@ fn resolve_provider_auth(
             expires,
             ..
         }) => {
-            let expired = expires.map_or(false, |value| value <= now_millis());
+            let expired = expires.is_some_and(|value| value <= now_millis());
             if expired {
                 if let Some(refresh) = refresh.as_deref() {
                     match refresh_oauth(provider, refresh) {
@@ -306,7 +301,9 @@ fn codex_live_streaming_text() {
 
     let context = LlmContext {
         system_prompt: "You are a helpful assistant. Be concise.".to_string(),
-        messages: vec![user_message("Reply with exactly: 'Hello codex test successful'.")],
+        messages: vec![user_message(
+            "Reply with exactly: 'Hello codex test successful'.",
+        )],
     };
 
     let saw_text = Rc::new(RefCell::new(false));
@@ -407,6 +404,206 @@ fn codex_live_tool_call() {
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolCall { .. }));
     assert!(has_tool_call);
+    assert!(*saw_tool.borrow());
+    assert_eq!(response.stop_reason, "toolUse");
+}
+
+// ----------------- Gemini CLI Tests -----------------
+
+const GEMINI_CLI_MODEL: &str = "gemini-2.5-flash";
+
+fn resolve_gemini_cli_auth() -> Option<(String, String)> {
+    // Try auth.json first
+    let path = get_auth_path();
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(cred) = data.get("google-gemini-cli") {
+                    if let (Some(access), Some(project)) = (
+                        cred.get("access").and_then(|v| v.as_str()),
+                        cred.get("project_id")
+                            .or_else(|| cred.get("projectId"))
+                            .and_then(|v| v.as_str()),
+                    ) {
+                        return Some((access.to_string(), project.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Try ~/.gemini/oauth_creds.json (official gemini CLI)
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let gemini_creds_path = home.join(".gemini").join("oauth_creds.json");
+    if gemini_creds_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&gemini_creds_path) {
+            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(access_token) = creds.get("access_token").and_then(|v| v.as_str()) {
+                    // Discover project ID
+                    match pi::api::google_gemini_cli::discover_gemini_project(access_token) {
+                        Ok(project_id) => return Some((access_token.to_string(), project_id)),
+                        Err(e) => {
+                            eprintln!("Failed to discover Gemini project: {e}");
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[test]
+#[ignore = "requires live subscription credentials"]
+fn gemini_cli_live_streaming_text() {
+    if !require_live() {
+        return;
+    }
+
+    let (access_token, project_id) = match resolve_gemini_cli_auth() {
+        Some(auth) => auth,
+        None => {
+            eprintln!("Missing Gemini CLI auth (check auth.json or ~/.gemini/oauth_creds.json).");
+            return;
+        }
+    };
+
+    let storage = AuthStorage::new(get_auth_path());
+    let registry = ModelRegistry::new(storage, None);
+    let model = match resolve_model(&registry, "google-gemini-cli", GEMINI_CLI_MODEL) {
+        Some(model) => model,
+        None => return,
+    };
+
+    let context = LlmContext {
+        system_prompt: "You are a helpful assistant. Be concise.".to_string(),
+        messages: vec![user_message(
+            "Reply with exactly: 'Hello gemini test successful'.",
+        )],
+    };
+
+    let saw_text = Rc::new(RefCell::new(false));
+    let saw_text_ref = saw_text.clone();
+    let mut events = StreamEvents::new(Box::new(move |event| {
+        if matches!(
+            event,
+            pi::ai::AssistantMessageEvent::TextStart { .. }
+                | pi::ai::AssistantMessageEvent::TextDelta { .. }
+        ) {
+            *saw_text_ref.borrow_mut() = true;
+        }
+    }));
+
+    let response = pi::api::google_gemini_cli::stream_google_gemini_cli(
+        &model,
+        &context,
+        pi::api::google_gemini_cli::GeminiCliCallOptions {
+            model: &model.id,
+            access_token: &access_token,
+            project_id: &project_id,
+            tools: &[],
+            base_url: &model.base_url,
+            system: Some(&context.system_prompt),
+            thinking_enabled: model.reasoning,
+        },
+        &mut events,
+    )
+    .expect("gemini cli stream");
+
+    // Check for text content (may include thinking)
+    let text = text_from_blocks(&response.content);
+    assert!(
+        !text.is_empty()
+            || response
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+    );
+    assert!(
+        *saw_text.borrow()
+            || response
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+    );
+    assert!(response.usage.total_tokens.unwrap_or(0) > 0);
+    assert_eq!(response.stop_reason, "stop");
+}
+
+#[test]
+#[ignore = "requires live subscription credentials"]
+fn gemini_cli_live_tool_call() {
+    if !require_live() {
+        return;
+    }
+
+    let (access_token, project_id) = match resolve_gemini_cli_auth() {
+        Some(auth) => auth,
+        None => {
+            eprintln!("Missing Gemini CLI auth (check auth.json or ~/.gemini/oauth_creds.json).");
+            return;
+        }
+    };
+
+    let storage = AuthStorage::new(get_auth_path());
+    let registry = ModelRegistry::new(storage, None);
+    let model = match resolve_model(&registry, "google-gemini-cli", GEMINI_CLI_MODEL) {
+        Some(model) => model,
+        None => return,
+    };
+
+    let context = LlmContext {
+        system_prompt: "Always call the calculator tool for arithmetic. Do not answer directly."
+            .to_string(),
+        messages: vec![user_message("Calculate 15 + 27 using the calculator tool.")],
+    };
+
+    let tools = vec![pi::api::google_gemini_cli::GeminiCliTool {
+        name: "calculator".to_string(),
+        description: "Perform basic arithmetic operations".to_string(),
+        parameters: calculator_schema(),
+    }];
+
+    let saw_tool = Rc::new(RefCell::new(false));
+    let saw_tool_ref = saw_tool.clone();
+    let mut events = StreamEvents::new(Box::new(move |event| {
+        if matches!(
+            event,
+            pi::ai::AssistantMessageEvent::ToolCallStart { .. }
+                | pi::ai::AssistantMessageEvent::ToolCallDelta { .. }
+                | pi::ai::AssistantMessageEvent::ToolCallEnd { .. }
+        ) {
+            *saw_tool_ref.borrow_mut() = true;
+        }
+    }));
+
+    let response = pi::api::google_gemini_cli::stream_google_gemini_cli(
+        &model,
+        &context,
+        pi::api::google_gemini_cli::GeminiCliCallOptions {
+            model: &model.id,
+            access_token: &access_token,
+            project_id: &project_id,
+            tools: &tools,
+            base_url: &model.base_url,
+            system: Some(&context.system_prompt),
+            thinking_enabled: model.reasoning,
+        },
+        &mut events,
+    )
+    .expect("gemini cli tool stream");
+
+    let has_gemini_tool_call = response
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolCall { .. }));
+    assert!(has_gemini_tool_call);
     assert!(*saw_tool.borrow());
     assert_eq!(response.stop_reason, "toolUse");
 }
