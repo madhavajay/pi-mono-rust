@@ -81,6 +81,15 @@ fn agent_event_value(event: &AgentEvent) -> Value {
             "result": agent_tool_result_value(result),
             "isError": is_error,
         }),
+        AgentEvent::ApprovalRequest(request) => json!({
+            "type": "approval_request",
+            "toolCallId": request.tool_call_id,
+            "toolName": request.tool_name,
+            "args": request.args,
+            "command": request.command,
+            "cwd": request.cwd,
+            "reason": request.reason,
+        }),
     }
 }
 

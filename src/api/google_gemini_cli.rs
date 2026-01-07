@@ -1103,7 +1103,10 @@ pub fn discover_gemini_project(access_token: &str) -> Result<String, String> {
 // They are intentionally public, similar to how Chrome's OAuth client ID is public.
 fn google_oauth_client_id() -> String {
     // Split to avoid secret scanner false positives
-    let parts = ["NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5", "ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t"];
+    let parts = [
+        "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5",
+        "ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t",
+    ];
     let encoded = parts.join("");
     String::from_utf8(
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
