@@ -3,7 +3,9 @@ use crate::agent::{
     ThinkingLevel,
 };
 use crate::coding_agent::export_html::export_session_to_html;
-use crate::coding_agent::extension_host::{ExtensionHost, ExtensionUiRequest, ExtensionUiResponse};
+use crate::coding_agent::extension_host::{
+    ExtensionCommand, ExtensionHost, ExtensionUiRequest, ExtensionUiResponse,
+};
 use crate::coding_agent::hooks::{
     CompactionHook, CompactionResult, SessionBeforeCompactEvent, SessionCompactEvent,
 };
@@ -47,6 +49,7 @@ pub struct AgentSession {
     pub settings_manager: SettingsManager,
     pub model_registry: ModelRegistry,
     prompt_templates: Vec<PromptTemplate>,
+    extension_commands: Vec<ExtensionCommand>,
     branch_summary_aborted: Cell<bool>,
     compaction_hooks: Vec<CompactionHook>,
     extension_host: Option<Rc<RefCell<ExtensionHost>>>,
@@ -121,6 +124,7 @@ impl AgentSession {
             settings_manager,
             model_registry,
             prompt_templates: Vec::new(),
+            extension_commands: Vec::new(),
             branch_summary_aborted: Cell::new(false),
             compaction_hooks: Vec::new(),
             extension_host: None,
@@ -179,6 +183,14 @@ impl AgentSession {
 
     pub fn prompt_templates(&self) -> &[PromptTemplate] {
         &self.prompt_templates
+    }
+
+    pub fn set_extension_commands(&mut self, commands: Vec<ExtensionCommand>) {
+        self.extension_commands = commands;
+    }
+
+    pub fn extension_commands(&self) -> &[ExtensionCommand] {
+        &self.extension_commands
     }
 
     pub fn pending_message_count(&self) -> usize {
@@ -1668,7 +1680,7 @@ pub struct BranchResult {
     pub cancelled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NavigateTreeOptions {
     pub summarize: bool,
     pub custom_instructions: Option<String>,

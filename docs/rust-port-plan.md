@@ -286,11 +286,18 @@ Planned modules (initial, not final):
   - `/logout` command: Opens OAuth provider selector (showing logged-in providers), removes credentials.
   - Credentials stored via `ModelRegistry::set_credential()` / `remove_credential()`.
   - Browser auto-open via platform-specific commands (xdg-open/open/start).
+- **Clipboard image paste**:
+  - Ctrl+V in TUI editor checks clipboard for image content.
+  - Linux: Supports both Wayland (wl-paste) and X11 (xclip) clipboard access.
+  - macOS: Uses pngpaste utility.
+  - Windows: Uses PowerShell to read clipboard image.
+  - Image written to temp file with UUID-based name (pi-clipboard-{UUID}.png).
+  - File path inserted at cursor position for inclusion in message.
 
 ## Remaining Gaps (Accurate as of 2026-01-07)
 
-### Interactive TUI - Minor Gaps:
-1. **Clipboard image paste** - Ctrl+V not supported for images
+### Interactive TUI:
+- All major features implemented. No known gaps.
 
 ### TS Extensions:
 - JS extensions work, TS extensions load via jiti when available (with fallback message if jiti not installed)

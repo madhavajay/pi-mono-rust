@@ -165,8 +165,8 @@ fn env_api_key(provider: &str) -> Option<String> {
     }
 
     if provider == "google-vertex" && has_vertex_adc_credentials() {
-        let has_project = env::var("GOOGLE_CLOUD_PROJECT").is_ok()
-            || env::var("GCLOUD_PROJECT").is_ok();
+        let has_project =
+            env::var("GOOGLE_CLOUD_PROJECT").is_ok() || env::var("GCLOUD_PROJECT").is_ok();
         let has_location = env::var("GOOGLE_CLOUD_LOCATION").is_ok();
         if has_project && has_location {
             return Some("<authenticated>".to_string());

@@ -55,6 +55,7 @@ enum EditorAction {
     Submit,
     Exit,
     Continue,
+    PasteImage,
 }
 
 /// Modal UI state for selectors
@@ -330,36 +331,92 @@ fn render_interactive_ui(
     Ok(())
 }
 
-/// Convert crossterm KeyEvent to a key data string for matches_key
+/// Convert crossterm KeyEvent to raw terminal sequence for matches_key.
+/// The matches_key function expects raw terminal bytes, not human-readable names.
 fn key_event_to_data(key: &KeyEvent) -> String {
-    let mut modifiers = String::new();
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        modifiers.push_str("ctrl+");
-    }
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
-        modifiers.push_str("shift+");
-    }
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        modifiers.push_str("alt+");
-    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    let key_str = match key.code {
-        KeyCode::Up => "up".to_string(),
-        KeyCode::Down => "down".to_string(),
-        KeyCode::Left => "left".to_string(),
-        KeyCode::Right => "right".to_string(),
-        KeyCode::Enter => "enter".to_string(),
-        KeyCode::Esc => "escape".to_string(),
-        KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Tab => "tab".to_string(),
-        KeyCode::Char(ch) => ch.to_string(),
-        _ => String::new(),
+    // Calculate modifier parameter for CSI sequences (1 + modifier bits)
+    // Shift=1, Alt=2, Ctrl=4
+    let modifier_param = if ctrl || shift || alt {
+        let mut m = 1u8; // Base is 1
+        if shift {
+            m += 1;
+        }
+        if alt {
+            m += 2;
+        }
+        if ctrl {
+            m += 4;
+        }
+        Some(m)
+    } else {
+        None
     };
 
-    if modifiers.is_empty() {
-        key_str
-    } else {
-        format!("{}{}", modifiers, key_str)
+    match key.code {
+        KeyCode::Up => {
+            if let Some(m) = modifier_param {
+                format!("\x1b[1;{}A", m)
+            } else {
+                "\x1b[A".to_string()
+            }
+        }
+        KeyCode::Down => {
+            if let Some(m) = modifier_param {
+                format!("\x1b[1;{}B", m)
+            } else {
+                "\x1b[B".to_string()
+            }
+        }
+        KeyCode::Right => {
+            if let Some(m) = modifier_param {
+                format!("\x1b[1;{}C", m)
+            } else {
+                "\x1b[C".to_string()
+            }
+        }
+        KeyCode::Left => {
+            if let Some(m) = modifier_param {
+                format!("\x1b[1;{}D", m)
+            } else {
+                "\x1b[D".to_string()
+            }
+        }
+        KeyCode::Enter => "\r".to_string(),
+        KeyCode::Esc => "\x1b".to_string(),
+        KeyCode::Backspace => {
+            if alt {
+                "\x1b\x7f".to_string()
+            } else {
+                "\x7f".to_string()
+            }
+        }
+        KeyCode::Tab => {
+            if shift {
+                "\x1b[Z".to_string()
+            } else {
+                "\t".to_string()
+            }
+        }
+        KeyCode::Home => "\x1b[H".to_string(),
+        KeyCode::End => "\x1b[F".to_string(),
+        KeyCode::Delete => "\x1b[3~".to_string(),
+        KeyCode::Char(ch) => {
+            if ctrl && ch.is_ascii_alphabetic() {
+                // Ctrl+letter produces control character (a=1, b=2, ..., z=26)
+                let code = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
+                String::from(code as char)
+            } else if shift && ch.is_ascii_lowercase() {
+                // Shift+letter produces uppercase
+                ch.to_ascii_uppercase().to_string()
+            } else {
+                ch.to_string()
+            }
+        }
+        _ => String::new(),
     }
 }
 
@@ -917,6 +974,9 @@ fn handle_key_event(key: KeyEvent, editor: &mut Editor) -> EditorAction {
         }
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             editor.handle_input("\x17");
+        }
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return EditorAction::PasteImage;
         }
         KeyCode::Char(ch) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1726,12 +1786,15 @@ pub fn run_interactive_mode_session(
                             "Enter: send message",
                             "Ctrl/Alt/Shift+Enter: new line",
                             "Ctrl+C: exit",
+                            "Ctrl+V: paste image from clipboard",
                             "Arrow keys: move cursor / history",
                             "Ctrl+Left/Right: move by word",
                             "Ctrl+A: start of line",
                             "Ctrl+W or Alt+Backspace: delete word",
-                            "Tab: insert tab",
-                            "/ commands: /export /compact /share /model /settings /changelog /hotkeys",
+                            "Tab: file autocomplete",
+                            "! command: run shell command",
+                            "!! command: run shell command (excluded from context)",
+                            "/ commands: type / to see autocomplete suggestions",
                         ]
                         .join("\n");
                         append_status_entry(&mut entries, &hotkeys);
@@ -1969,6 +2032,13 @@ pub fn run_interactive_mode_session(
                 EditorAction::Continue => {
                     render_interactive_ui(&entries, &mut editor, &mut stdout)?;
                 }
+                EditorAction::PasteImage => {
+                    // Handle Ctrl+V image paste
+                    if let Some(path) = paste_image_from_clipboard() {
+                        editor.insert_text_at_cursor(&path);
+                    }
+                    render_interactive_ui(&entries, &mut editor, &mut stdout)?;
+                }
             },
             Event::Resize(_, _) => {
                 render_interactive_ui(&entries, &mut editor, &mut stdout)?;
@@ -2105,4 +2175,125 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     }
 
     Err("No clipboard command available. Install xclip, xsel, or wl-copy.".to_string())
+}
+
+/// Check if clipboard contains an image and paste it to a temp file.
+/// Returns the file path if successful.
+fn paste_image_from_clipboard() -> Option<String> {
+    use std::fs;
+    use std::process::Command;
+    use uuid::Uuid;
+
+    // Try to detect if clipboard has image content
+    // On Wayland: wl-paste --list-types
+    // On X11: xclip -selection clipboard -t TARGETS -o
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try Wayland first (wl-paste)
+        if let Ok(output) = Command::new("wl-paste").args(["--list-types"]).output() {
+            if output.status.success() {
+                let types = String::from_utf8_lossy(&output.stdout);
+                let has_image = types.lines().any(|t| {
+                    t == "image/png" || t == "image/jpeg" || t == "image/gif" || t == "image/webp"
+                });
+                if has_image {
+                    // Paste the image
+                    if let Ok(output) = Command::new("wl-paste")
+                        .args(["--type", "image/png"])
+                        .output()
+                    {
+                        if output.status.success() && !output.stdout.is_empty() {
+                            let tmp_dir = std::env::temp_dir();
+                            let file_name = format!("pi-clipboard-{}.png", Uuid::new_v4());
+                            let file_path = tmp_dir.join(file_name);
+                            if fs::write(&file_path, &output.stdout).is_ok() {
+                                return Some(file_path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try X11 (xclip)
+        if let Ok(output) = Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+            .output()
+        {
+            if output.status.success() {
+                let types = String::from_utf8_lossy(&output.stdout);
+                let has_image = types.lines().any(|t| {
+                    t == "image/png" || t == "image/jpeg" || t == "image/gif" || t == "image/webp"
+                });
+                if has_image {
+                    // Paste the image
+                    if let Ok(output) = Command::new("xclip")
+                        .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+                        .output()
+                    {
+                        if output.status.success() && !output.stdout.is_empty() {
+                            let tmp_dir = std::env::temp_dir();
+                            let file_name = format!("pi-clipboard-{}.png", Uuid::new_v4());
+                            let file_path = tmp_dir.join(file_name);
+                            if fs::write(&file_path, &output.stdout).is_ok() {
+                                return Some(file_path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: Use osascript to check clipboard type and pngpaste for image
+        // First check if pngpaste is available
+        if let Ok(output) = Command::new("pngpaste").args(["-"]).output() {
+            if output.status.success() && !output.stdout.is_empty() {
+                let tmp_dir = std::env::temp_dir();
+                let file_name = format!("pi-clipboard-{}.png", Uuid::new_v4());
+                let file_path = tmp_dir.join(file_name);
+                if fs::write(&file_path, &output.stdout).is_ok() {
+                    return Some(file_path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: Use PowerShell to get clipboard image
+        let script = r#"
+            Add-Type -AssemblyName System.Windows.Forms
+            $img = [System.Windows.Forms.Clipboard]::GetImage()
+            if ($img -ne $null) {
+                $ms = New-Object System.IO.MemoryStream
+                $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+                [Convert]::ToBase64String($ms.ToArray())
+            }
+        "#;
+        if let Ok(output) = Command::new("powershell")
+            .args(["-Command", script])
+            .output()
+        {
+            if output.status.success() {
+                let base64_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !base64_str.is_empty() {
+                    use base64::{engine::general_purpose, Engine};
+                    if let Ok(data) = general_purpose::STANDARD.decode(&base64_str) {
+                        let tmp_dir = std::env::temp_dir();
+                        let file_name = format!("pi-clipboard-{}.png", Uuid::new_v4());
+                        let file_path = tmp_dir.join(file_name);
+                        if fs::write(&file_path, &data).is_ok() {
+                            return Some(file_path.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

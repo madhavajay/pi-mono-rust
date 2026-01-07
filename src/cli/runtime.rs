@@ -1,6 +1,6 @@
 use crate::cli::args::{ExtensionFlagType, ExtensionFlagValue};
 use crate::cli::auth::apply_env_api_keys_for_availability;
-use crate::coding_agent::extension_host::ExtensionTool;
+use crate::coding_agent::extension_host::{ExtensionCommand, ExtensionTool};
 use crate::coding_agent::{
     discover_extension_paths, ExtensionHost, ExtensionManifest, Model as RegistryModel,
     ModelRegistry, SettingsManager,
@@ -390,6 +390,9 @@ fn attach_extensions(session: &mut crate::coding_agent::AgentSession, cwd: &Path
     match ExtensionHost::spawn(&discovered, cwd) {
         Ok((host, manifest)) => {
             report_extension_manifest(&manifest);
+            // Store extension commands for autocomplete
+            let commands = collect_extension_commands(&manifest);
+            session.set_extension_commands(commands);
             session.set_extension_host_shared(Rc::new(RefCell::new(host)));
         }
         Err(err) => {
@@ -404,6 +407,14 @@ pub fn collect_extension_tools(manifest: &ExtensionManifest) -> Vec<ExtensionToo
         tools.extend(extension.tools.clone());
     }
     tools
+}
+
+pub fn collect_extension_commands(manifest: &ExtensionManifest) -> Vec<ExtensionCommand> {
+    let mut commands = Vec::new();
+    for extension in &manifest.extensions {
+        commands.extend(extension.commands.clone());
+    }
+    commands
 }
 
 pub fn report_extension_manifest(manifest: &ExtensionManifest) {

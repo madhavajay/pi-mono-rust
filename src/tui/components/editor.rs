@@ -261,6 +261,12 @@ impl Editor {
         }
     }
 
+    /// Insert text at the current cursor position.
+    /// This is a public wrapper for insert_text.
+    pub fn insert_text_at_cursor(&mut self, text: &str) {
+        self.insert_text(text);
+    }
+
     fn insert_character(&mut self, text: &str) {
         let current_line = self.state.lines[self.state.cursor_line].clone();
         let before = &current_line[..self.state.cursor_col];

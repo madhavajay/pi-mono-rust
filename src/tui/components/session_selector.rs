@@ -314,6 +314,11 @@ impl SessionSelectorComponent {
     pub fn session_list_mut(&mut self) -> &mut SessionList {
         &mut self.session_list
     }
+
+    /// Get the currently selected session path (if any)
+    pub fn get_selected(&self) -> Option<PathBuf> {
+        self.session_list.get_selected()
+    }
 }
 
 #[cfg(test)]
